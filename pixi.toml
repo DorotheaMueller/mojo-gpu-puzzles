@@ -64,6 +64,9 @@ build-book = "cd book && mdbook build"
 book = { cmd = "cd book && mdbook serve --open", depends-on = ["build-book"] }
 clean = { cmd = "cd book && mdbook clean" }
 
+extra_p04_transpose_matrix = "mojo problems/extra_problems/p04_transpose_matrix.mojo"
+extra_p04_transpose_matrix_layout_tensor = "mojo problems/extra_problems/p04_transpose_matrix_layout_tensor.mojo"
+
 p01 = "mojo problems/p01/p01.mojo"
 viz01 = "cd book/src/puzzle_01 && python puzzle_01_viz.py"
 
