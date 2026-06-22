@@ -4,11 +4,11 @@ version = "1.0.0"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 dependencies = [
-    "mojo>=0.25.7.0.dev2025100107,<1.0.0",
-    "max==26.1.0.dev2026010820",
+    "mojo>=0.26.3.0.dev2026042005,<1.0.0",
+    "max==26.3.0.dev2026042005",
     "poethepoet>=0.34.0",
     "scipy>=1.15.3",
-    "torch==2.7.1",
+    "torch==2.12.0",
 ]
 
 [project.optional-dependencies]
@@ -95,16 +95,16 @@ p15 = "mojo problems/p15/p15.mojo"
 p16 = "mojo problems/p16/p16.mojo"
 
 p17 = [
-    { cmd = "mojo package problems/p17/op -o problems/p17/op.mojopkg" },
+    { cmd = "mojo package problems/p17/op -o problems/p17/op.mojoc" },
     { cmd = "python problems/p17/p17.py" }
 ]
 
-p18-package = "mojo package problems/p18/op -o problems/p18/op.mojopkg"
+p18-package = "mojo package problems/p18/op -o problems/p18/op.mojoc"
 p18-test-kernels = { cmd = "mojo run -I problems/p18 problems/p18/test/test_softmax.mojo", deps = ["p18-package"] }
 p18 = { cmd = "python problems/p18/p18.py", deps = ["p18-package"] }
 
 p19 = [
-    { cmd = "mojo package problems/p19/op -o problems/p19/op.mojopkg" },
+    { cmd = "mojo package problems/p19/op -o problems/p19/op.mojoc" },
     { cmd = "python problems/p19/p19.py" }
 ]
 
@@ -138,5 +138,6 @@ p33 = "mojo problems/p33/p33.mojo"
 
 p34 = "mojo problems/p34/p34.mojo"
 
-# GPU specs
-gpu-specs = { cmd = "python scripts/gpu_specs.py" }
+# GPU information
+gpu-info = { cmd = "python3 scripts/gpu_specs.py --summary" }
+gpu-specs = { cmd = "python3 scripts/gpu_specs.py" }

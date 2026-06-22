@@ -1,7 +1,12 @@
+# ===----------------------------------------------------------------------=== #
+#
+# This file is Modular Inc proprietary.
+#
+# ===----------------------------------------------------------------------=== #
 from pathlib import Path
 
 import numpy as np
-from max.driver import CPU, Accelerator, Device, Tensor, accelerator_count
+from max.driver import CPU, Accelerator, Buffer, Device
 from max.dtype import DType
 from max.engine import InferenceSession
 from max.graph import DeviceRef, Graph, TensorType, ops
@@ -13,9 +18,9 @@ def softmax(
     input: NDArray[np.float32],
     session: InferenceSession,
     device: Device,
-) -> Tensor:
+) -> Buffer:
     dtype = DType.float32
-    input_tensor = Tensor.from_numpy(input).to(device)
+    input_tensor = Buffer.from_numpy(input).to(device)
     mojo_kernels = Path(__file__).parent / "op"
     # ANCHOR: softmax_custom_op_graph_solution
     with Graph(
@@ -59,7 +64,7 @@ def softmax(
     print(f"Executing softmax on {device}")
     print("=" * 100)
     result = model.execute(input_tensor)[0]
-    assert isinstance(result, Tensor)
+    assert isinstance(result, Buffer)
     return result.to(CPU()) if device == Accelerator() else result
 
 

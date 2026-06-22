@@ -1,43 +1,46 @@
-from gpu import thread_idx, block_idx, block_dim, barrier
-from gpu.host import DeviceContext
-from gpu.memory import AddressSpace
-from layout import Layout, LayoutTensor
-from sys import size_of, argv
-from math import log2
-from testing import assert_equal
+# ===----------------------------------------------------------------------=== #
+#
+# This file is Modular Inc proprietary.
+#
+# ===----------------------------------------------------------------------=== #
+from std.gpu import thread_idx, block_idx, block_dim, barrier
+from std.gpu.host import DeviceContext
+from std.gpu.memory import AddressSpace
+from layout import TileTensor
+from layout.tile_layout import row_major
+from layout.tile_tensor import stack_allocation
+from std.sys import argv
+from std.math import log2
+from std.testing import assert_equal
 
 comptime TPB = 8
 comptime SIZE = 8
 comptime BLOCKS_PER_GRID = (1, 1)
 comptime THREADS_PER_BLOCK = (TPB, 1)
 comptime dtype = DType.float32
-comptime layout = Layout.row_major(SIZE)
+comptime layout = row_major[SIZE]()
+comptime LayoutType = type_of(layout)
 
 
 # ANCHOR: prefix_sum_simple_solution
-fn prefix_sum_simple[
-    layout: Layout
-](
-    output: LayoutTensor[dtype, layout, MutAnyOrigin],
-    a: LayoutTensor[dtype, layout, ImmutAnyOrigin],
-    size: UInt,
+def prefix_sum_simple(
+    output: TileTensor[mut=True, dtype, LayoutType, MutAnyOrigin],
+    a: TileTensor[mut=False, dtype, LayoutType, ImmutAnyOrigin],
+    size: Int,
 ):
-    global_i = block_dim.x * block_idx.x + thread_idx.x
-    local_i = thread_idx.x
-    shared = LayoutTensor[
-        dtype,
-        Layout.row_major(TPB),
-        MutAnyOrigin,
-        address_space = AddressSpace.SHARED,
-    ].stack_allocation()
+    var global_i = block_dim.x * block_idx.x + thread_idx.x
+    var local_i = thread_idx.x
+    var shared = stack_allocation[
+        dtype=dtype, address_space=AddressSpace.SHARED
+    ](row_major[TPB]())
     if global_i < size:
         shared[local_i] = a[global_i]
 
     barrier()
 
-    offset = UInt(1)
-    for i in range(Int(log2(Scalar[dtype](TPB)))):
-        var current_val: output.element_type = 0
+    var offset = 1
+    for _ in range(Int(log2(Scalar[dtype](TPB)))):
+        var current_val: output.ElementType = 0
         if local_i >= offset and local_i < size:
             current_val = shared[local_i - offset]  # read
 
@@ -59,28 +62,25 @@ comptime SIZE_2 = 15
 comptime BLOCKS_PER_GRID_2 = (2, 1)
 comptime THREADS_PER_BLOCK_2 = (TPB, 1)
 comptime EXTENDED_SIZE = SIZE_2 + 2  # up to 2 blocks
-comptime layout_2 = Layout.row_major(SIZE_2)
-comptime extended_layout = Layout.row_major(EXTENDED_SIZE)
+comptime layout_2 = row_major[SIZE_2]()
+comptime extended_layout = row_major[EXTENDED_SIZE]()
+comptime Layout2Type = type_of(layout_2)
+comptime ExtendedLayout = type_of(extended_layout)
 
 # ANCHOR: prefix_sum_complete_solution
 
 
 # Kernel 1: Compute local prefix sums and store block sums in out
-fn prefix_sum_local_phase[
-    out_layout: Layout, in_layout: Layout
-](
-    output: LayoutTensor[dtype, out_layout, MutAnyOrigin],
-    a: LayoutTensor[dtype, in_layout, ImmutAnyOrigin],
-    size: UInt,
+def prefix_sum_local_phase(
+    output: TileTensor[mut=True, dtype, ExtendedLayout, MutAnyOrigin],
+    a: TileTensor[mut=False, dtype, Layout2Type, ImmutAnyOrigin],
+    size: Int,
 ):
-    global_i = block_dim.x * block_idx.x + thread_idx.x
-    local_i = thread_idx.x
-    shared = LayoutTensor[
-        dtype,
-        Layout.row_major(TPB),
-        MutAnyOrigin,
-        address_space = AddressSpace.SHARED,
-    ].stack_allocation()
+    var global_i = block_dim.x * block_idx.x + thread_idx.x
+    var local_i = thread_idx.x
+    var shared = stack_allocation[
+        dtype=dtype, address_space=AddressSpace.SHARED
+    ](row_major[TPB]())
 
     # Load data into shared memory
     # Example with SIZE_2=15, TPB=8, BLOCKS=2:
@@ -102,9 +102,9 @@ fn prefix_sum_local_phase[
     # Iteration 3 (offset=4):
     #   Block 0: [0,1,3,6,10+0,14+1,18+3,22+6] = [0,1,3,6,10,15,21,28]
     #   Block 1 follows same pattern to get [8,17,27,38,50,63,77,???]
-    offset = UInt(1)
-    for i in range(Int(log2(Scalar[dtype](TPB)))):
-        var current_val: output.element_type = 0
+    var offset = 1
+    for _ in range(Int(log2(Scalar[dtype](TPB)))):
+        var current_val: output.ElementType = 0
         if local_i >= offset and local_i < TPB:
             current_val = shared[local_i - offset]  # read
 
@@ -132,10 +132,11 @@ fn prefix_sum_local_phase[
 
 
 # Kernel 2: Add block sums to their respective blocks
-fn prefix_sum_block_sum_phase[
-    layout: Layout
-](output: LayoutTensor[dtype, layout, MutAnyOrigin], size: UInt):
-    global_i = block_dim.x * block_idx.x + thread_idx.x
+def prefix_sum_block_sum_phase(
+    output: TileTensor[mut=True, dtype, ExtendedLayout, MutAnyOrigin],
+    size: Int,
+):
+    var global_i = block_dim.x * block_idx.x + thread_idx.x
 
     # Second pass: add previous block's sum to each element
     # Block 0: No change needed - already correct
@@ -145,73 +146,70 @@ fn prefix_sum_block_sum_phase[
     # Final result combines both blocks:
     # [0,1,3,6,10,15,21,28, 36,45,55,66,78,91,105]
     if block_idx.x > 0 and global_i < size:
-        prev_block_sum = output[size + block_idx.x - 1]
+        var prev_block_sum = output[size + block_idx.x - 1]
         output[global_i] += prev_block_sum
 
 
 # ANCHOR_END: prefix_sum_complete_solution
 
 
-def main():
+def main() raises:
     with DeviceContext() as ctx:
-        use_simple = argv()[1] == "--simple"
-        size = SIZE if use_simple else SIZE_2
-        num_blocks = (size + TPB - 1) // TPB
+        var use_simple = argv()[1] == "--simple"
+        var size = SIZE if use_simple else SIZE_2
+        var num_blocks = (size + TPB - 1) // TPB
 
         if not use_simple and num_blocks > EXTENDED_SIZE - SIZE_2:
             raise Error("Extended buffer too small for the number of blocks")
 
-        buffer_size = size if use_simple else EXTENDED_SIZE
-        out = ctx.enqueue_create_buffer[dtype](buffer_size)
+        var buffer_size = size if use_simple else EXTENDED_SIZE
+        var out = ctx.enqueue_create_buffer[dtype](buffer_size)
         out.enqueue_fill(0)
-        a = ctx.enqueue_create_buffer[dtype](size)
+        var a = ctx.enqueue_create_buffer[dtype](size)
         a.enqueue_fill(0)
 
         with a.map_to_host() as a_host:
             for i in range(size):
-                a_host[i] = i
+                a_host[i] = Scalar[dtype](i)
 
         if use_simple:
-            a_tensor = LayoutTensor[dtype, layout, ImmutAnyOrigin](a)
-            out_tensor = LayoutTensor[dtype, layout, MutAnyOrigin](out)
+            a_tensor = TileTensor[mut=False, dtype, LayoutType](a, layout)
+            out_tensor = TileTensor(out, layout)
 
-            comptime kernel = prefix_sum_simple[layout]
-            ctx.enqueue_function[kernel, kernel](
+            ctx.enqueue_function[prefix_sum_simple](
                 out_tensor,
                 a_tensor,
-                UInt(size),
+                size,
                 grid_dim=BLOCKS_PER_GRID,
                 block_dim=THREADS_PER_BLOCK,
             )
         else:
-            var a_tensor = LayoutTensor[dtype, layout_2, ImmutAnyOrigin](a)
-            var out_tensor = LayoutTensor[dtype, extended_layout, MutAnyOrigin](
-                out
+            var a_tensor = TileTensor[mut=False, dtype, Layout2Type](
+                a, layout_2
             )
+            var out_tensor = TileTensor(out, extended_layout)
 
             # ANCHOR: prefix_sum_complete_block_level_sync
             # Phase 1: Local prefix sums
-            comptime kernel = prefix_sum_local_phase[extended_layout, layout_2]
-            ctx.enqueue_function[kernel, kernel](
+            ctx.enqueue_function[prefix_sum_local_phase](
                 out_tensor,
                 a_tensor,
-                UInt(size),
+                size,
                 grid_dim=BLOCKS_PER_GRID_2,
                 block_dim=THREADS_PER_BLOCK_2,
             )
 
             # Phase 2: Add block sums
-            comptime kernel2 = prefix_sum_block_sum_phase[extended_layout]
-            ctx.enqueue_function[kernel2, kernel2](
+            ctx.enqueue_function[prefix_sum_block_sum_phase](
                 out_tensor,
-                UInt(size),
+                size,
                 grid_dim=BLOCKS_PER_GRID_2,
                 block_dim=THREADS_PER_BLOCK_2,
             )
             # ANCHOR_END: prefix_sum_complete_block_level_sync
 
         # Verify results for both cases
-        expected = ctx.enqueue_create_host_buffer[dtype](size)
+        var expected = ctx.enqueue_create_host_buffer[dtype](size)
         expected.enqueue_fill(0)
         ctx.synchronize()
 
@@ -233,3 +231,4 @@ def main():
             size = size if use_simple else SIZE_2
             for i in range(size):
                 assert_equal(out_host[i], expected[i])
+            print("Puzzle 14 complete ✅")

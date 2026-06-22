@@ -1,66 +1,75 @@
-from gpu import thread_idx, block_idx, block_dim, barrier
-from gpu.host import DeviceContext
-from gpu.memory import AddressSpace
-from layout import Layout, LayoutTensor
+# ===----------------------------------------------------------------------=== #
+#
+# This file is Modular Inc proprietary.
+#
+# ===----------------------------------------------------------------------=== #
+from std.gpu import thread_idx, block_idx, block_dim, barrier
+from std.gpu.host import DeviceContext
+from std.gpu.memory import AddressSpace
+from layout import TileTensor
+from layout.tile_layout import row_major, TensorLayout
+from layout.tile_tensor import stack_allocation
+from std.utils import Index
+from std.sys import argv
+from std.testing import assert_equal
 
 # ANCHOR: conv1d_kernel
 comptime TPB = 15
 comptime BLOCKS_PER_GRID = (2, 1)
 
 
-fn conv1d_kernel[
-    in_layout: Layout,
-    out_layout: Layout,
-    conv_layout: Layout,
+def conv1d_kernel[
     input_size: Int,
     conv_size: Int,
+    OutLayout: TensorLayout,
+    InLayout: TensorLayout,
+    ConvLayout: TensorLayout,
     dtype: DType = DType.float32,
 ](
-    output: LayoutTensor[dtype, out_layout, MutAnyOrigin],
-    input: LayoutTensor[dtype, in_layout, MutAnyOrigin],
-    kernel: LayoutTensor[dtype, conv_layout, MutAnyOrigin],
+    output: TileTensor[mut=True, dtype, OutLayout, MutAnyOrigin],
+    input: TileTensor[mut=True, dtype, InLayout, MutAnyOrigin],
+    kernel: TileTensor[mut=True, dtype, ConvLayout, MutAnyOrigin],
 ):
-    global_i = Int(block_dim.x * block_idx.x + thread_idx.x)
-    local_i = Int(thread_idx.x)
+    var global_i = block_dim.x * block_idx.x + thread_idx.x
+    var local_i = thread_idx.x
+    # Convert generic TileTensors to LayoutTensor for indexing (flat_rank proof required)
+    var input_lt = input.to_layout_tensor()
+    var kernel_lt = kernel.to_layout_tensor()
+    var output_lt = output.to_layout_tensor()
     # first: need to account for padding
-    shared_a = LayoutTensor[
-        dtype,
-        Layout.row_major(TPB + conv_size - 1),
-        MutAnyOrigin,
-        address_space = AddressSpace.SHARED,
-    ].stack_allocation()
-    shared_b = LayoutTensor[
-        dtype,
-        Layout.row_major(conv_size),
-        MutAnyOrigin,
-        address_space = AddressSpace.SHARED,
-    ].stack_allocation()
+    var shared_a = stack_allocation[
+        dtype=dtype, address_space=AddressSpace.SHARED
+    ](row_major[TPB + conv_size - 1]())
+    var shared_b = stack_allocation[
+        dtype=dtype, address_space=AddressSpace.SHARED
+    ](row_major[conv_size]())
     if global_i < input_size:
-        shared_a[local_i] = input[global_i]
+        shared_a[local_i] = rebind[Scalar[dtype]](input_lt[global_i])
 
     # second: load elements needed for convolution at block boundary
     if local_i < conv_size - 1:
         # indices from next block
-        next_idx = global_i + TPB
+        var next_idx = global_i + TPB
         if next_idx < input_size:
-            shared_a[TPB + local_i] = input[next_idx]
+            shared_a[TPB + local_i] = rebind[Scalar[dtype]](input_lt[next_idx])
         else:
+            # Initialize out-of-bounds elements to 0 to avoid reading from uninitialized memory
+            # which is an undefined behavior
             shared_a[TPB + local_i] = 0
 
     if local_i < conv_size:
-        shared_b[local_i] = kernel[local_i]
+        shared_b[local_i] = rebind[Scalar[dtype]](kernel_lt[local_i])
 
     barrier()
 
     if global_i < input_size:
-        var local_sum: output.element_type = 0
+        var local_sum: Scalar[dtype] = 0
 
-        @parameter
-        for j in range(conv_size):
+        comptime for j in range(conv_size):
             if local_i + j < TPB + conv_size - 1:
                 local_sum += shared_a[local_i + j] * shared_b[j]
 
-        output[global_i] = local_sum
+        output_lt.store[1](Index(global_i), local_sum)
 
 
 # ANCHOR_END: conv1d_kernel
@@ -68,43 +77,50 @@ fn conv1d_kernel[
 
 # ANCHOR: conv1d_custom_op
 import compiler
-from runtime.asyncrt import DeviceContextPtr
-from tensor import InputTensor, OutputTensor
-from memory import UnsafePointer
-from gpu.host import DeviceBuffer
+
+from extensibility import InputTensor, OutputTensor
+from std.memory import UnsafePointer
+from std.gpu.host import DeviceBuffer
 
 
 @compiler.register("conv1d")
 struct Conv1DCustomOp:
     @staticmethod
-    fn execute[
+    def execute[
         # The kind of device this will be run on: "cpu" or "gpu"
         target: StaticString,
         input_size: Int,
         conv_size: Int,
         dtype: DType = DType.float32,
     ](
-        output: OutputTensor[rank=1],
-        input: InputTensor[rank = output.rank],
-        kernel: InputTensor[rank = output.rank],
+        output: OutputTensor[dtype=dtype, rank=1, static_spec=_],
+        input: InputTensor[dtype=dtype, rank=output.rank, static_spec=_],
+        kernel: InputTensor[dtype=dtype, rank=output.rank, static_spec=_],
         # the context is needed for some GPU calls
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) raises:
-        output_tensor = output.to_layout_tensor()
-        input_tensor = input.to_layout_tensor()
-        kernel_tensor = kernel.to_layout_tensor()
-        comptime in_layout = input_tensor.layout
-        comptime out_layout = output_tensor.layout
-        comptime conv_layout = kernel_tensor.layout
+        comptime out_layout_val = row_major[input_size]()
+        comptime OutLayout = type_of(out_layout_val)
+        comptime conv_layout_val = row_major[conv_size]()
+        comptime ConvLayout = type_of(conv_layout_val)
 
-        @parameter
-        if target == "gpu":
-            gpu_ctx = ctx.get_device_context()
+        var output_tensor = TileTensor[
+            mut=True, dtype, OutLayout, MutAnyOrigin
+        ](output.unsafe_ptr(), out_layout_val)
+        var input_tensor = TileTensor[mut=True, dtype, OutLayout, MutAnyOrigin](
+            input.unsafe_ptr(), out_layout_val
+        )
+        var kernel_tensor = TileTensor[
+            mut=True, dtype, ConvLayout, MutAnyOrigin
+        ](kernel.unsafe_ptr(), conv_layout_val)
+
+        comptime if target == "gpu":
+            var gpu_ctx = ctx
             # making sure the output tensor is zeroed out before the kernel is called
             gpu_ctx.enqueue_memset(
                 DeviceBuffer[output_tensor.dtype](
                     gpu_ctx,
-                    output_tensor.ptr,
+                    output.unsafe_ptr(),
                     input_size,
                     owning=False,
                 ),

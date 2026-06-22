@@ -31,25 +31,32 @@
   <a href="https://forum.modular.com/c/">
     <img src="https://img.shields.io/badge/Modular-Forum-9B59B6?logo=discourse" alt="Modular Forum">
   </a>
-  <a href="https://discord.com/channels/1087530497313357884/1098713601386233997">
+  <a href="https://discord.gg/modular">
     <img src="https://img.shields.io/badge/Discord-Join_Chat-5865F2?logo=discord" alt="Discord">
   </a>
 </p>
 
 ## Overview
 
-> _"For the things we have to learn before we can do them, we learn by doing them."_
-> — Aristotle, (Nicomachean Ethics)
+> _"For the things we have to learn before we can do them, we learn by doing
+> them."_ — Aristotle, (Nicomachean Ethics)
 
-Welcome to **Mojo🔥 GPU Puzzles, Edition 1** — an interactive approach to learning GPU programming through hands-on puzzle solving. Instead of traditional textbook learning, you'll immediately dive into writing real GPU code and seeing the results.
+Welcome to **Mojo🔥 GPU Puzzles, Edition 1** — an interactive approach to
+learning GPU programming through hands-on puzzle solving. Instead of traditional
+textbook learning, you'll immediately dive into writing real GPU code and seeing
+the results.
 
 Start Learning Now 👉 [puzzles.modular.com](https://puzzles.modular.com/)
 
-> 📬 [Subscribe to updates](https://www.modular.com/company/talk-to-us) to get notified when new puzzles are released!
+> 📬
+> [Subscribe to updates](https://docs.modular.com/max/get-started/#stay-in-touch)
+> to get notified when new puzzles are released!
 
 ## Why Mojo🔥
 
-[Mojo](https://docs.modular.com/mojo/manual/) represents a revolutionary approach to GPU programming, making massive parallelism accessible while maintaining systems-level performance:
+[Mojo](https://docs.modular.com/mojo/manual/) represents a revolutionary
+approach to GPU programming, making massive parallelism accessible while
+maintaining systems-level performance:
 
 - 🐍 **Python-like Syntax** with systems programming capabilities
 - ⚡ **Zero-cost Abstractions** that compile to efficient machine code
@@ -63,7 +70,9 @@ Start Learning Now 👉 [puzzles.modular.com](https://puzzles.modular.com/)
 
 ### Prerequisites
 
-You'll need a [compatible GPU](https://docs.modular.com/max/faq#gpu-requirements) to run the examples.
+You'll need a
+[compatible GPU](https://docs.modular.com/max/faq#gpu-requirements) to run the
+examples.
 
 1. Visit [puzzles.modular.com](https://puzzles.modular.com)
 2. Clone this repository
@@ -75,54 +84,59 @@ You'll need a [compatible GPU](https://docs.modular.com/max/faq#gpu-requirements
 
 3. Install a package manager to run the Mojo🔥 programs:
 
-   ### **Option 1 (Highly recommended)**: [pixi](https://pixi.sh/latest/#installation)
+### Option 1: [pixi](https://pixi.sh/latest/#installation) (Highly recommended)
 
-    `pixi` is the **recommended option** for this project because:
-    - Easy access to Modular's MAX/Mojo packages
-    - Handles GPU dependencies
-    - Full conda + PyPI ecosystem support
+   `pixi` is the **recommended option** for this project because:
 
-    **Note: A few puzzles only work with `pixi`.**
+- Easy access to Modular's MAX/Mojo packages
+- Handles GPU dependencies
+- Full conda + PyPI ecosystem support
 
-    **Install:**
+   **Note: A few puzzles only work with `pixi`.**
 
-    ```bash
-    curl -fsSL https://pixi.sh/install.sh | sh
-    ```
+   **Install:**
 
-    **Update:**
+   ```bash
+   curl -fsSL https://pixi.sh/install.sh | sh
+   ```
 
-    ```bash
-    pixi self-update
-    ```
+   **Update:**
 
-   ### Option 2: [`uv`](https://docs.astral.sh/uv/getting-started/installation/)
+   ```bash
+   pixi self-update
+   ```
 
-    **Install:**
+### Option 2: [`uv`](https://docs.astral.sh/uv/getting-started/installation/)
 
-    ```bash
-    curl -fsSL https://astral.sh/uv/install.sh | sh
-    ```
+   **Install:**
 
-    **Update:**
+   ```bash
+   curl -fsSL https://astral.sh/uv/install.sh | sh
+   ```
 
-    ```bash
-    uv self update
-    ```
+   **Update:**
 
-    **Create a virtual environment:**
+   ```bash
+   uv self update
+   ```
 
-    ```bash
-    uv venv && source .venv/bin/activate
-    ```
+   **Create a virtual environment:**
+
+   ```bash
+   uv venv && source .venv/bin/activate
+   ```
 
 4. Start solving puzzles!
 
 ## Development
 
-We use `pixi` for development as it includes `uv` and also supports conda packages (like `mdbook` from the `conda-forge` channel) needed for development workflows.
+We use `pixi` for development as it includes `uv` and also supports conda
+packages (like `mdbook` from the `conda-forge` channel) needed for development
+workflows.
 
-> **WSL Users**: Before running `pixi run book`, install the required browser integration package:
+> **WSL Users**: Before running `pixi run book`, install the required browser
+> integration package:
+>
 > ```bash
 > sudo apt update && sudo apt install wslu
 > ```
@@ -158,14 +172,36 @@ pixi run format
 We welcome contributions! Whether it's:
 
 - 📝 Improving explanations
-- 🐛 Fixing bugs ([report bug](https://github.com/modular/mojo-gpu-puzzles/issues/new?template=bug_report.yml))
-- 💡 Suggesting improvements ([request feature](https://github.com/modular/mojo-gpu-puzzles/issues/new?template=feature_request.yml))
+- 🐛 Fixing bugs
+  ([report bug](https://github.com/modular/mojo-gpu-puzzles/issues/new?template=bug_report.yml))
+- 💡 Suggesting improvements
+  ([request feature](https://github.com/modular/mojo-gpu-puzzles/issues/new?template=feature_request.yml))
 
 Please feel free to:
 
 1. Fork the repository
 2. Create your feature branch
 3. Submit a pull request
+
+### Keeping problems and solutions in sync
+
+Each `problems/pNN/` file is the same as its `solutions/pNN/` counterpart
+**except** that the student fill-in regions are blanked out with `# FILL ME IN`
+hints (and an optional `...` placeholder so an empty body still compiles), and
+the `# ANCHOR:` markers drop the `_solution` suffix the solution uses. Solving a
+puzzle should therefore only ever *add* lines.
+
+When you change a solution (for example, migrating to a new API), update the
+matching problem skeleton the same way. Two checks guard this (both run in CI):
+
+```bash
+pixi run check-skeletons    # problem == solution outside the fill-in regions
+pixi run compile-problems   # every unfilled skeleton still compiles
+```
+
+(`problems/p10` is intentionally exempt — it is the sanitizer puzzle, whose
+skeleton ships deliberately buggy kernels for you to catch with `memcheck` /
+`racecheck`.)
 
 ## Community
 
@@ -176,22 +212,26 @@ Please feel free to:
   <a href="https://forum.modular.com/c/">
     <img src="https://img.shields.io/badge/Modular-Forum-9B59B6?logo=discourse" alt="Modular Forum">
   </a>
-  <a href="https://discord.com/channels/1087530497313357884/1098713601386233997">
+  <a href="https://discord.gg/modular">
     <img src="https://img.shields.io/badge/Discord-Join_Chat-5865F2?logo=discord" alt="Discord">
   </a>
 </p>
 
-Join our vibrant community to discuss GPU programming, share solutions, and get help!
+Join our vibrant community to discuss GPU programming, share solutions, and get
+help!
 
 ## Acknowledgments
 
-- Thanks to all our [contributors](https://github.com/modular/mojo-gpu-puzzles/graphs/contributors)
-- Initial puzzles are heavily inspired by [GPU Puzzles](https://github.com/srush/GPU-Puzzles)
+- Thanks to all our
+  [contributors](https://github.com/modular/mojo-gpu-puzzles/graphs/contributors)
+- Initial puzzles are heavily inspired by
+  [GPU Puzzles](https://github.com/srush/GPU-Puzzles)
 - Built with [mdBook](https://rust-lang.github.io/mdBook/)
 
 ## License
 
-This project is licensed under the LLVM License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the LLVM License - see the [LICENSE](LICENSE)
+file for details.
 
 <p align="center">
   <sub>Built with ❤️ by the Modular team</sub>

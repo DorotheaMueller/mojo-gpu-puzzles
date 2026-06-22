@@ -2,7 +2,7 @@
 authors = ["Modular <hello@modular.com>"]
 channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
 name = "mojo-gpu-puzzles"
-platforms = ["linux-64", "osx-arm64"]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
 version = "1.0.0"
 
 [feature.nvidia]
@@ -18,6 +18,15 @@ nsight-compute = "*"  # interactive kernel profiling
 torch = { version = "==2.7.1", index = "https://download.pytorch.org/whl/cu128" }
 nvidia-ml-py = "*"
 
+[feature.nvidia.target.linux-aarch64.dependencies]
+cuda-toolkit = "12.*" # for compute-sanitizer etc.
+cuda-gdb = "12.*"     # for GPU kernel debugging
+nsight-compute = "*"  # interactive kernel profiling
+
+[feature.nvidia.target.linux-aarch64.pypi-dependencies]
+torch = { version = "==2.9.0", index = "https://download.pytorch.org/whl/cu130" }
+nvidia-ml-py = "*"
+
 [feature.amd]
 system-requirements = {}
 
@@ -31,7 +40,7 @@ system-requirements = { macos = "15.0" }
 [dependencies]
 python = "==3.12"
 mojo = "<1.0.0" # includes `mojo-compiler`, lsp, debugger, formatter etc.
-max = "==26.1.0.dev2026011405"
+max = ">=26.3.0.dev2026042817"
 bash = ">=5.2.21,<6"
 manim = ">=0.18.1,<0.19"
 mdbook = ">=0.4.48,<0.5"
@@ -50,6 +59,11 @@ format-check = { cmd = "bash -c 'mojo format problems solutions && git diff --ex
 
 tests = { cmd = "bash solutions/run.sh" }
 
+check-book-refs = { cmd = "python3 scripts/check_book_refs.py", description = "Validate book links/images resolve (en + ko trees)" }
+
+check-skeletons = { cmd = "python3 scripts/check_skeletons.py", description = "Verify each problem skeleton matches its solution outside the fill-in regions" }
+compile-problems = { cmd = "bash scripts/compile_problems.sh", description = "Compile every problem skeleton so a stale starter file fails CI" }
+
 # Setup CUDA-GDB by linking system CUDA installation to conda environment
 setup-cuda-gdb = { cmd = "bash scripts/setup-cuda-gdb.sh", description = "Auto-detect and link system CUDA-GDB binaries to conda environment" }
 
@@ -60,9 +74,9 @@ synccheck = { cmd = "bash solutions/sanitizer.sh synccheck", depends-on = ["zero
 initcheck = { cmd = "bash solutions/sanitizer.sh initcheck", depends-on = ["zero-memory-manager"] }
 sanitizers = { cmd = "bash solutions/sanitizer.sh all", depends-on = ["zero-memory-manager"] }
 
-build-book = "cd book && mdbook build"
-book = { cmd = "cd book && mdbook serve --open", depends-on = ["build-book"] }
-clean = { cmd = "cd book && mdbook clean" }
+build-book = { cmd = "bash scripts/build_book.sh", description = "Build English + all translated mdbook languages" }
+book = { cmd = "bash scripts/serve_book.sh", description = "Serve mdbook with live reload for all languages" }
+clean = { cmd = "cd book && mdbook clean && rm -rf html-*", description = "Remove all book build artifacts" }
 
 extra_p04_transpose_matrix = "mojo problems/extra_problems/p04_transpose_matrix.mojo"
 extra_p04_transpose_matrix_layout_tensor = "mojo problems/extra_problems/p04_transpose_matrix_layout_tensor.mojo"
@@ -77,24 +91,21 @@ p03 = "mojo problems/p03/p03.mojo"
 viz03 = "cd book/src/puzzle_03 && python puzzle_03_viz.py"
 
 p04 = "mojo problems/p04/p04.mojo"
-p04_layout_tensor = "mojo problems/p04/p04_layout_tensor.mojo"
+p04_tile_tensor = "mojo problems/p04/p04_tile_tensor.mojo"
 viz04 = "cd book/src/puzzle_04 && python puzzle_04_viz.py"
 thread_indexing = "cd book/src/puzzle_04 && python thread_indexing_viz.py"
-layout_tensor_intro = "mojo book/src/puzzle_04/intro.mojo"
+tile_tensor_intro = "mojo book/src/puzzle_04/intro.mojo"
 
 p05 = "mojo problems/p05/p05.mojo"
-p05_layout_tensor = "mojo problems/p05/p05_layout_tensor.mojo"
 viz05 = "cd book/src/puzzle_05 && python puzzle_05_viz.py"
 
 p06 = "mojo problems/p06/p06.mojo"
 viz06 = "cd book/src/puzzle_06 && python puzzle_06_viz.py"
 
 p07 = "mojo problems/p07/p07.mojo"
-p07_layout_tensor = "mojo problems/p07/p07_layout_tensor.mojo"
 viz07 = "cd book/src/puzzle_07 && python puzzle_07_viz.py"
 
 p08 = "mojo problems/p08/p08.mojo"
-p08_layout_tensor = "mojo problems/p08/p08_layout_tensor.mojo"
 viz08 = "cd book/src/puzzle_08 && python puzzle_08_viz.py"
 
 p09 = "mojo problems/p09/p09.mojo"
@@ -102,11 +113,9 @@ p09 = "mojo problems/p09/p09.mojo"
 p10 = "mojo problems/p10/p10.mojo"
 
 p11 = "mojo problems/p11/p11.mojo"
-p11_layout_tensor = "mojo problems/p11/p11_layout_tensor.mojo"
 viz11 = "cd book/src/puzzle_11 && python puzzle_11_viz.py"
 
 p12 = "mojo problems/p12/p12.mojo"
-p12_layout_tensor = "mojo problems/p12/p12_layout_tensor.mojo"
 viz12 = "cd book/src/puzzle_12 && python puzzle_12_viz.py"
 
 p13 = "mojo problems/p13/p13.mojo"
@@ -122,13 +131,13 @@ p16 = "mojo problems/p16/p16.mojo"
 viz16 = "cd book/src/puzzle_16 && python puzzle_16_viz.py"
 rooflineviz = "cd book/src/puzzle_16 && python roofline_viz.py"
 
-p17 = "mojo package problems/p17/op -o problems/p17/op.mojopkg && python problems/p17/p17.py"
+p17 = "mojo package problems/p17/op -o problems/p17/op.mojoc && python problems/p17/p17.py"
 
-p18-package = "mojo package problems/p18/op -o problems/p18/op.mojopkg"
+p18-package = "mojo package problems/p18/op -o problems/p18/op.mojoc"
 p18-test-kernels = { cmd = "mojo run -I problems/p18 problems/p18/test/test_softmax.mojo", depends-on = ["p18-package"] }
 p18 = { cmd = "python problems/p18/p18.py", depends-on = ["p18-package"] }
 
-p19 = "mojo package problems/p19/op -o problems/p19/op.mojopkg && python problems/p19/p19.py"
+p19 = "mojo package problems/p19/op -o problems/p19/op.mojoc && python problems/p19/p19.py"
 
 p20 = "python problems/p20/p20.py"
 
@@ -160,14 +169,14 @@ p33 = "mojo problems/p33/p33.mojo"
 
 p34 = "mojo problems/p34/p34.mojo"
 
-# NVIDIA GPU information and profiling utilities
-gpu-info = { cmd = "nvidia-smi --query-gpu=name,compute_cap,memory.total,driver_version --format=csv", description = "Get basic GPU information" }
+p35 = "mojo problems/p35/p35.mojo"
 
-# GPU specs
+# GPU information and profiling utilities
+gpu-info = { cmd = "python3 scripts/gpu_specs.py --summary", description = "Get concise GPU information (cross-platform)" }
 gpu-specs = { cmd = "python3 scripts/gpu_specs.py", description = "Get complete GPU architectural specifications (NVIDIA/AMD/Apple Silicon)" }
 
-# macOS
-check-macos = { cmd = "sw_vers -productVersion | awk -F. '{if($1<15) {print \"Error: macOS 15+ required, found \" $0; exit 1}}'", description = "Ensure macOS 15+" }
+# macOS environment validation
+check-macos = { cmd = "python3 scripts/check_macos_env.py", description = "Validate macOS environment (version, Xcode, Metal toolchain)" }
 
 generate-animations = { cmd = "echo 'All animations generated!'", depends-on = ["viz01", "viz02", "viz03", "viz04", "viz05", "viz06", "viz07", "viz08", "viz11", "viz12", "viz13", "viz14", "viz15", "viz16", "rooflineviz", "thread_indexing"] }
 clean-animations = "find book/src -type d -name media | xargs rm -rf"

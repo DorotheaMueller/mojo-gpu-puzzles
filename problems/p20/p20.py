@@ -1,10 +1,15 @@
-from typing import Optional
+# ===----------------------------------------------------------------------=== #
+#
+# This file is Modular Inc proprietary.
+#
+# ===----------------------------------------------------------------------=== #
 from pathlib import Path
+
 import numpy as np
 
 # ANCHOR: conv1d_pytorch
 import torch
-from max.torch import CustomOpLibrary
+from max.experimental.torch import CustomOpLibrary
 
 
 def conv1d_pytorch(
@@ -25,7 +30,7 @@ def conv1d_pytorch(
 
     # Call our custom conv1d operation with explicit output tensor
     # The Mojo signature expects: (out, input, kernel)
-    conv1d = ops.conv1d[
+    _conv1d = ops.conv1d[
         {
             "input_size": input_tensor.shape[0],
             "conv_size": kernel_tensor.shape[0],
@@ -43,13 +48,13 @@ def conv1d_pytorch(
 def conv1d_max_graph_reference(
     input_array: np.ndarray,
     kernel_array: np.ndarray,
-    device: Optional[str] = None,
+    device: str | None = None,
 ) -> np.ndarray:
     """
     Reference implementation using MAX Graph (like p15) for comparison.
     This shows the difference between MAX Graph and PyTorch approaches.
     """
-    from max.driver import CPU, Accelerator, Tensor, accelerator_count
+    from max.driver import CPU, Accelerator, Buffer, accelerator_count
     from max.dtype import DType
     from max.engine import InferenceSession
     from max.graph import DeviceRef, Graph, TensorType, ops
@@ -63,8 +68,8 @@ def conv1d_max_graph_reference(
     session = InferenceSession(devices=[device_obj])
 
     # Convert to MAX Graph tensors
-    input_tensor = Tensor.from_numpy(input_array).to(device_obj)
-    kernel_tensor = Tensor.from_numpy(kernel_array).to(device_obj)
+    input_tensor = Buffer.from_numpy(input_array).to(device_obj)
+    kernel_tensor = Buffer.from_numpy(kernel_array).to(device_obj)
 
     # Same graph setup as p15
     with Graph(

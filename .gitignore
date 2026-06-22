@@ -9,20 +9,27 @@ __pycache__
 # Book artifacts
 book/book
 book/html
+book/html-*
 
 book/src/puzzle_*/media/images/
 book/src/puzzle_*/media/texts/
 book/src/puzzle_*/media/Tex/
 book/src/puzzle_*/media/videos/*/partial_movie_files/
+book/src/puzzle_*/media/videos/*/*.gif
+book/src/puzzle_*/media/*.gif
 
 # Vercel
 .vercel
 
 # Mojo artifacts
+*.mojoc
 *.mojopkg
 
 # rules
 .cursor/
+.claude/
+.agents/
+.agent/
 
 # llvm
 *.ll

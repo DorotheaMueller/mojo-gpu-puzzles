@@ -2,19 +2,23 @@
 
 ## Overview
 
-This puzzle implements matrix multiplication for square matrices \\(A\\) and \\(B\\), storing results in \\(\text{output}\\) while leveraging shared memory to optimize memory access patterns. The implementation preloads matrix blocks into shared memory before performing computations.
+This puzzle implements matrix multiplication for square matrices \\(A\\) and
+\\(B\\), storing results in \\(\text{output}\\) while leveraging shared memory
+to optimize memory access patterns. The implementation preloads matrix blocks
+into shared memory before performing computations.
 
 ## Key concepts
 
 This puzzle covers:
 
-- Block-local memory management with LayoutTensor
+- Block-local memory management with TileTensor
 - Thread synchronization patterns
 - Memory access optimization using shared memory
 - Collaborative data loading with 2D indexing
-- Efficient use of LayoutTensor for matrix operations
+- Efficient use of TileTensor for matrix operations
 
-The central concept involves utilizing fast shared memory through LayoutTensor to minimize costly global memory accesses.
+The central concept involves utilizing fast shared memory through TileTensor to
+minimize costly global memory accesses.
 
 ## Configuration
 
@@ -24,15 +28,15 @@ The central concept involves utilizing fast shared memory through LayoutTensor t
 
 Layout configuration:
 
-- Input A: `Layout.row_major(SIZE, SIZE)`
-- Input B: `Layout.row_major(SIZE, SIZE)`
-- Output: `Layout.row_major(SIZE, SIZE)`
-- Shared Memory: Two `TPB × TPB` LayoutTensors
+- Input A: `row_major[SIZE, SIZE]()`
+- Input B: `row_major[SIZE, SIZE]()`
+- Output: `row_major[SIZE, SIZE]()`
+- Shared Memory: Two `TPB × TPB` TileTensors
 
 Memory organization:
 
 ```txt
-Global Memory (LayoutTensor):          Shared Memory (LayoutTensor):
+Global Memory (TileTensor):          Shared Memory (TileTensor):
 A[i,j]: Direct access                  a_shared[local_row, local_col]
 B[i,j]: Direct access                  b_shared[local_row, local_col]
 ```
@@ -117,7 +121,8 @@ expected: HostBuffer([4.0, 6.0, 12.0, 22.0])
 
 <div class="solution-explanation">
 
-The shared memory implementation with LayoutTensor improves performance through efficient memory access patterns:
+The shared memory implementation with TileTensor improves performance through
+efficient memory access patterns:
 
 ### Memory organization
 
@@ -138,9 +143,9 @@ Matrix B:                           b_shared: (similar layout)
 1. **Shared Memory Setup**:
 
    ```mojo
-   # Create 2D shared memory tensors using LayoutTensor with address_space
-   a_shared = LayoutTensor[dtype, Layout.row_major(TPB, TPB), MutAnyOrigin, address_space = AddressSpace.SHARED].stack_allocation()
-   b_shared = LayoutTensor[dtype, Layout.row_major(TPB, TPB), MutAnyOrigin, address_space = AddressSpace.SHARED].stack_allocation()
+   # Create 2D shared memory tensors using TileTensor with address_space
+   a_shared = stack_allocation[dtype=dtype, address_space=AddressSpace.SHARED](row_major[TPB, TPB]())
+   b_shared = stack_allocation[dtype=dtype, address_space=AddressSpace.SHARED](row_major[TPB, TPB]())
    ```
 
 2. **Thread Indexing**:
@@ -158,7 +163,7 @@ Matrix B:                           b_shared: (similar layout)
 3. **Data Loading**:
 
    ```mojo
-   # Load data into shared memory using LayoutTensor indexing
+   # Load data into shared memory using TileTensor indexing
    if row < size and col < size:
        a_shared[local_row, local_col] = a[row, col]
        b_shared[local_row, local_col] = b[row, col]
@@ -217,13 +222,13 @@ Matrix B:                           b_shared: (similar layout)
 
 ### Key language features
 
-1. **LayoutTensor benefits**:
+1. **TileTensor benefits**:
    - Direct 2D indexing simplifies code
    - Type safety through `element_type`
    - Efficient memory layout handling
 
 2. **Shared memory allocation**:
-   - LayoutTensor with address_space for structured allocation
+   - TileTensor with address_space for structured allocation
    - Row-major layout matching input tensors
    - Proper alignment for efficient access
 
@@ -249,11 +254,12 @@ Matrix B:                           b_shared: (similar layout)
    - Better cache utilization
    - Improved instruction throughput
 
-This implementation significantly improves performance over the naive version by:
+This implementation significantly improves performance over the naive version
+by:
 
 - Reducing global memory accesses
 - Enabling data reuse through shared memory
-- Using efficient 2D indexing with LayoutTensor
+- Using efficient 2D indexing with TileTensor
 - Maintaining proper thread synchronization
 
 </div>

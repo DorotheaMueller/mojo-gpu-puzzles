@@ -1,13 +1,21 @@
-from math import sqrt
-from gpu import thread_idx, block_idx, block_dim, barrier
-from gpu.memory import async_copy_wait_all, AddressSpace
-from os.atomic import Atomic
-from layout import Layout, LayoutTensor
-from layout.layout_tensor import copy_dram_to_sram_async
+# ===----------------------------------------------------------------------=== #
+#
+# This file is Modular Inc proprietary.
+#
+# ===----------------------------------------------------------------------=== #
+from std.math import sqrt
+from std.gpu import thread_idx, block_idx, block_dim, barrier
+from std.gpu.memory import AddressSpace
+from std.atomic import Atomic
+from layout import TileTensor
+from layout.tile_layout import row_major, TensorLayout
+from layout.tile_tensor import stack_allocation
 import compiler
-from runtime.asyncrt import DeviceContextPtr
-from tensor import InputTensor, OutputTensor
-from utils import StaticTuple
+
+from std.gpu.host import DeviceContext
+
+from extensibility import InputTensor, OutputTensor
+from std.utils import StaticTuple
 
 comptime MATMUL_BLOCK_DIM_XY = 16  # Square blocks for a, b and output
 comptime MATMUL_NUM_THREADS = MATMUL_BLOCK_DIM_XY * MATMUL_BLOCK_DIM_XY
@@ -17,115 +25,109 @@ comptime TRANSPOSE_BLOCK_DIM_XY = 16  # Square blocks for input and output
 
 # ANCHOR: matmul_idiomatic_tiled
 # Idiomatic tiled matmul from p19.mojo
-fn matmul_idiomatic_tiled[
-    a_layout: Layout,
-    b_layout: Layout,
-    out_layout: Layout,
+def matmul_idiomatic_tiled[
     rows: Int,
     cols: Int,
     inner: Int,
+    OutLayout: TensorLayout,
+    ALayout: TensorLayout,
+    BLayout: TensorLayout,
     dtype: DType = DType.float32,
 ](
-    output: LayoutTensor[dtype, out_layout, MutAnyOrigin],
-    a: LayoutTensor[dtype, a_layout, MutAnyOrigin],
-    b: LayoutTensor[dtype, b_layout, MutAnyOrigin],
+    output: TileTensor[mut=True, dtype, OutLayout, MutAnyOrigin],
+    a: TileTensor[mut=True, dtype, ALayout, MutAnyOrigin],
+    b: TileTensor[mut=True, dtype, BLayout, MutAnyOrigin],
 ):
     """Idiomatic tiled matrix multiplication from p19."""
-    local_row = thread_idx.y
-    local_col = thread_idx.x
-    tiled_row = Int(block_idx.y * MATMUL_BLOCK_DIM_XY + local_row)
-    tiled_col = Int(block_idx.x * MATMUL_BLOCK_DIM_XY + local_col)
+    var local_row = thread_idx.y
+    var local_col = thread_idx.x
+    var tiled_row = block_idx.y * MATMUL_BLOCK_DIM_XY + local_row
+    var tiled_col = block_idx.x * MATMUL_BLOCK_DIM_XY + local_col
 
     # Get the tile of the output matrix that this thread block is responsible for
-    out_tile = output.tile[MATMUL_BLOCK_DIM_XY, MATMUL_BLOCK_DIM_XY](
-        Int(block_idx.y), Int(block_idx.x)
+    var out_tile = output.tile[MATMUL_BLOCK_DIM_XY, MATMUL_BLOCK_DIM_XY](
+        block_idx.y, block_idx.x
     )
-    a_shared = LayoutTensor[
-        dtype,
-        Layout.row_major(MATMUL_BLOCK_DIM_XY, MATMUL_BLOCK_DIM_XY),
-        MutAnyOrigin,
-        address_space = AddressSpace.SHARED,
-    ].stack_allocation()
-    b_shared = LayoutTensor[
-        dtype,
-        Layout.row_major(MATMUL_BLOCK_DIM_XY, MATMUL_BLOCK_DIM_XY),
-        MutAnyOrigin,
-        address_space = AddressSpace.SHARED,
-    ].stack_allocation()
-    var acc: output.element_type = 0
-
-    comptime load_a_layout = Layout.row_major(
+    comptime shared_layout = row_major[
         MATMUL_BLOCK_DIM_XY, MATMUL_BLOCK_DIM_XY
-    )  # Coalesced loading
-    comptime load_b_layout = Layout.row_major(
-        MATMUL_BLOCK_DIM_XY, MATMUL_BLOCK_DIM_XY
-    )  # Coalesced loading
+    ]()
+    var a_shared = stack_allocation[
+        dtype=dtype, address_space=AddressSpace.SHARED
+    ](shared_layout)
+    var b_shared = stack_allocation[
+        dtype=dtype, address_space=AddressSpace.SHARED
+    ](shared_layout)
+    var acc: output.ElementType = 0
 
-    @parameter
-    for idx in range((inner + MATMUL_BLOCK_DIM_XY - 1) // MATMUL_BLOCK_DIM_XY):
-        # Get tiles from A and B matrices
-        a_tile = a.tile[MATMUL_BLOCK_DIM_XY, MATMUL_BLOCK_DIM_XY](
-            Int(block_idx.y), idx
-        )
-        b_tile = b.tile[MATMUL_BLOCK_DIM_XY, MATMUL_BLOCK_DIM_XY](
-            idx, Int(block_idx.x)
-        )
+    var a_lt = a.to_layout_tensor()
+    var b_lt = b.to_layout_tensor()
+    var out_tile_lt = out_tile.to_layout_tensor()
+    var a_shared_lt = a_shared.to_layout_tensor()
+    var b_shared_lt = b_shared.to_layout_tensor()
 
-        # Asynchronously copy tiles to shared memory with consistent orientation
-        copy_dram_to_sram_async[
-            thread_layout=load_a_layout,
-            num_threads=MATMUL_NUM_THREADS,
-            block_dim_count=MATMUL_BLOCK_DIM_COUNT,
-        ](a_shared, a_tile)
-        copy_dram_to_sram_async[
-            thread_layout=load_b_layout,
-            num_threads=MATMUL_NUM_THREADS,
-            block_dim_count=MATMUL_BLOCK_DIM_COUNT,
-        ](b_shared, b_tile)
+    comptime for idx in range(
+        (inner + MATMUL_BLOCK_DIM_XY - 1) // MATMUL_BLOCK_DIM_XY
+    ):
+        # Synchronously load tiles to shared memory - each thread loads one element
+        var a_tile_row_start = block_idx.y * MATMUL_BLOCK_DIM_XY
+        var a_tile_col_start = idx * MATMUL_BLOCK_DIM_XY
+        var b_tile_row_start = idx * MATMUL_BLOCK_DIM_XY
+        var b_tile_col_start = block_idx.x * MATMUL_BLOCK_DIM_XY
 
-        # Wait for all async copies to complete
-        async_copy_wait_all()
+        var a_global_row = a_tile_row_start + local_row
+        var a_global_col = a_tile_col_start + local_col
+        if a_global_row < rows and a_global_col < inner:
+            a_shared_lt[local_row, local_col] = a_lt[a_global_row, a_global_col]
+        else:
+            a_shared_lt[local_row, local_col] = 0
+
+        var b_global_row = b_tile_row_start + local_row
+        var b_global_col = b_tile_col_start + local_col
+        if b_global_row < inner and b_global_col < cols:
+            b_shared_lt[local_row, local_col] = b_lt[b_global_row, b_global_col]
+        else:
+            b_shared_lt[local_row, local_col] = 0
+
         barrier()
 
         # Compute partial matrix multiplication for this tile
-        @parameter
-        for k in range(MATMUL_BLOCK_DIM_XY):
-            if (
-                tiled_row < rows and tiled_col < cols
-            ):  # Only perform calculation for valid outputs
-                if k < a_tile.dim(
-                    1
-                ):  # Only perform calculation on valid inputs
-                    acc += a_shared[local_row, k] * b_shared[k, local_col]
+        comptime k_max = min(
+            MATMUL_BLOCK_DIM_XY, inner - idx * MATMUL_BLOCK_DIM_XY
+        )
+        comptime for k in range(k_max):
+            if tiled_row < rows and tiled_col < cols:
+                acc += rebind[Scalar[dtype]](
+                    a_shared_lt[local_row, k]
+                ) * rebind[Scalar[dtype]](b_shared_lt[k, local_col])
 
         barrier()
 
     # Write final result with bounds checking (needed for variable matrix sizes)
     if tiled_row < rows and tiled_col < cols:
-        out_tile[local_row, local_col] = acc
+        out_tile_lt[local_row, local_col] = acc
 
 
 # ANCHOR_END: matmul_idiomatic_tiled
 
 
 # ANCHOR: layernorm_kernel_solution
-fn layernorm_kernel[
-    input_layout: Layout,
-    ln_params_layout: Layout,
-    output_layout: Layout,
+def layernorm_kernel[
     batch_size: Int,
     seq_len: Int,
     hidden_dim: Int,
+    OutputLayout: TensorLayout,
+    InputLayout: TensorLayout,
+    LnParamsLayout: TensorLayout,
     dtype: DType = DType.float32,
 ](
-    output: LayoutTensor[dtype, output_layout, MutAnyOrigin],
-    input: LayoutTensor[dtype, input_layout, ImmutAnyOrigin],
-    ln_weight: LayoutTensor[dtype, ln_params_layout, ImmutAnyOrigin],
-    ln_bias: LayoutTensor[dtype, ln_params_layout, ImmutAnyOrigin],
+    output: TileTensor[mut=True, dtype, OutputLayout, MutAnyOrigin],
+    input: TileTensor[mut=True, dtype, InputLayout, MutAnyOrigin],
+    ln_weight: TileTensor[mut=True, dtype, LnParamsLayout, MutAnyOrigin],
+    ln_bias: TileTensor[mut=True, dtype, LnParamsLayout, MutAnyOrigin],
 ):
-    batch_idx = Int(block_idx.x)
-    seq_idx = Int(block_idx.y)
-    hidden_idx = Int(thread_idx.x)
+    var batch_idx = block_idx.x
+    var seq_idx = block_idx.y
+    var hidden_idx = thread_idx.x
 
     if (
         batch_idx >= batch_size
@@ -134,164 +136,181 @@ fn layernorm_kernel[
     ):
         return
 
+    var output_lt = output.to_layout_tensor()
+    var input_lt = input.to_layout_tensor()
+    var ln_weight_lt = ln_weight.to_layout_tensor()
+    var ln_bias_lt = ln_bias.to_layout_tensor()
+
     # Compute statistics for this sequence position (redundant but simple)
     var sum_val: Scalar[dtype] = 0
     var sq_sum: Scalar[dtype] = 0
 
-    @parameter
-    for h in range(hidden_dim):
-        val = input[batch_idx, seq_idx, h]
+    comptime for h in range(hidden_dim):
+        var val = input_lt[batch_idx, seq_idx, h]
         sum_val += rebind[Scalar[dtype]](val)
         sq_sum += rebind[Scalar[dtype]](val * val)
 
-    mean_val = sum_val / hidden_dim
-    var_val = (sq_sum / hidden_dim) - (mean_val * mean_val)
-    inv_std = 1.0 / sqrt(var_val + 1e-5)
+    var mean_val = sum_val / Scalar[dtype](hidden_dim)
+    var var_val = (sq_sum / Scalar[dtype](hidden_dim)) - (mean_val * mean_val)
+    var inv_std = 1.0 / sqrt(var_val + 1e-5)
 
     # Apply LayerNorm to this element
-    input_val = input[batch_idx, seq_idx, hidden_idx]
-    normalized = (input_val - mean_val) * inv_std * rebind[Scalar[dtype]](
-        ln_weight[hidden_idx]
-    ) + rebind[Scalar[dtype]](ln_bias[hidden_idx])
-    output[batch_idx, seq_idx, hidden_idx] = normalized
+    var input_val = input_lt[batch_idx, seq_idx, hidden_idx]
+    var normalized = (input_val - mean_val) * inv_std * rebind[Scalar[dtype]](
+        ln_weight_lt[hidden_idx]
+    ) + rebind[Scalar[dtype]](ln_bias_lt[hidden_idx])
+    output_lt[batch_idx, seq_idx, hidden_idx] = normalized
 
 
 # ANCHOR_END: layernorm_kernel_solution
 
 
 # ANCHOR: transpose_kernel_solution
-fn transpose_kernel[
-    layout_in: Layout,
-    layout_out: Layout,
-    rows: UInt,
-    cols: UInt,
+def transpose_kernel[
+    rows: Int,
+    cols: Int,
+    OutLayout: TensorLayout,
+    InLayout: TensorLayout,
     dtype: DType = DType.float32,
 ](
-    output: LayoutTensor[dtype, layout_out, MutAnyOrigin],
-    inp: LayoutTensor[dtype, layout_in, ImmutAnyOrigin],
+    output: TileTensor[mut=True, dtype, OutLayout, MutAnyOrigin],
+    inp: TileTensor[mut=True, dtype, InLayout, MutAnyOrigin],
 ):
     """Transpose matrix using shared memory tiling for coalesced access.
     We will learn more about coalesced access in the next part.
     """
-    shared_tile = LayoutTensor[
-        dtype,
-        Layout.row_major(TRANSPOSE_BLOCK_DIM_XY, TRANSPOSE_BLOCK_DIM_XY),
-        MutAnyOrigin,
-        address_space = AddressSpace.SHARED,
-    ].stack_allocation()
+    comptime shared_layout = row_major[
+        TRANSPOSE_BLOCK_DIM_XY, TRANSPOSE_BLOCK_DIM_XY
+    ]()
+    var shared_tile = stack_allocation[
+        dtype=dtype, address_space=AddressSpace.SHARED
+    ](shared_layout)
 
-    local_row = thread_idx.y
-    local_col = thread_idx.x
+    var local_row = thread_idx.y
+    var local_col = thread_idx.x
 
-    global_row = block_idx.y * TRANSPOSE_BLOCK_DIM_XY + local_row
-    global_col = block_idx.x * TRANSPOSE_BLOCK_DIM_XY + local_col
+    var inp_lt = inp.to_layout_tensor()
+    var output_lt = output.to_layout_tensor()
+    var shared_tile_lt = shared_tile.to_layout_tensor()
+
+    var global_row = block_idx.y * TRANSPOSE_BLOCK_DIM_XY + local_row
+    var global_col = block_idx.x * TRANSPOSE_BLOCK_DIM_XY + local_col
 
     if global_row < rows and global_col < cols:
-        shared_tile[local_row, local_col] = inp[global_row, global_col]
+        shared_tile_lt[local_row, local_col] = inp_lt[global_row, global_col]
 
     barrier()
 
-    out_row = block_idx.x * TRANSPOSE_BLOCK_DIM_XY + local_row
-    out_col = block_idx.y * TRANSPOSE_BLOCK_DIM_XY + local_col
+    var out_row = block_idx.x * TRANSPOSE_BLOCK_DIM_XY + local_row
+    var out_col = block_idx.y * TRANSPOSE_BLOCK_DIM_XY + local_col
 
     # Store data from shared memory to global memory (coalesced write)
     # Note: we transpose the shared memory access pattern
     if out_row < cols and out_col < rows:
-        output[out_row, out_col] = shared_tile[local_col, local_row]
+        output_lt[out_row, out_col] = shared_tile_lt[local_col, local_row]
 
 
 # ANCHOR_END: transpose_kernel_solution
 
 
 # ANCHOR: add_bias_kernel
-fn add_bias_kernel[
-    input_layout: Layout,
-    bias_layout: Layout,
-    output_layout: Layout,
+def add_bias_kernel[
     batch_size: Int,
     seq_len: Int,
     output_dim: Int,
+    OutputLayout: TensorLayout,
+    InputLayout: TensorLayout,
+    BiasLayout: TensorLayout,
     dtype: DType = DType.float32,
 ](
-    output: LayoutTensor[dtype, output_layout, MutAnyOrigin],
-    input: LayoutTensor[dtype, input_layout, MutAnyOrigin],
-    bias: LayoutTensor[dtype, bias_layout, ImmutAnyOrigin],
+    output: TileTensor[mut=True, dtype, OutputLayout, MutAnyOrigin],
+    input: TileTensor[mut=True, dtype, InputLayout, MutAnyOrigin],
+    bias: TileTensor[mut=True, dtype, BiasLayout, MutAnyOrigin],
 ):
     """Simple bias addition."""
-    batch_idx = Int(block_idx.x)
-    seq_idx = Int(block_idx.y)
-    out_idx = Int(thread_idx.x)
+    var batch_idx = block_idx.x
+    var seq_idx = block_idx.y
+    var out_idx = thread_idx.x
 
     if batch_idx >= batch_size or seq_idx >= seq_len or out_idx >= output_dim:
         return
 
-    output[batch_idx, seq_idx, out_idx] = input[
+    var output_lt = output.to_layout_tensor()
+    var input_lt = input.to_layout_tensor()
+    var bias_lt = bias.to_layout_tensor()
+
+    output_lt[batch_idx, seq_idx, out_idx] = input_lt[
         batch_idx, seq_idx, out_idx
-    ] + rebind[Scalar[dtype]](bias[out_idx])
+    ] + rebind[Scalar[dtype]](bias_lt[out_idx])
 
 
 # ANCHOR_END: add_bias_kernel
 
 
 # ANCHOR: minimal_fused_forward_kernel_solution
-fn minimal_fused_kernel[
-    input_layout: Layout,
-    ln_params_layout: Layout,
-    weight_layout: Layout,
-    bias_layout: Layout,
-    output_layout: Layout,
+def minimal_fused_kernel[
     batch_size: Int,
     seq_len: Int,
     hidden_dim: Int,
     output_dim: Int,
+    OutputLayout: TensorLayout,
+    InputLayout: TensorLayout,
+    LnParamsLayout: TensorLayout,
+    WeightLayout: TensorLayout,
+    BiasLayout: TensorLayout,
     dtype: DType = DType.float32,
 ](
-    output: LayoutTensor[dtype, output_layout, MutAnyOrigin],
-    input: LayoutTensor[dtype, input_layout, ImmutAnyOrigin],
-    ln_weight: LayoutTensor[dtype, ln_params_layout, ImmutAnyOrigin],
-    ln_bias: LayoutTensor[dtype, ln_params_layout, ImmutAnyOrigin],
-    linear_weight: LayoutTensor[dtype, weight_layout, ImmutAnyOrigin],
-    linear_bias: LayoutTensor[dtype, bias_layout, ImmutAnyOrigin],
+    output: TileTensor[mut=True, dtype, OutputLayout, MutAnyOrigin],
+    input: TileTensor[mut=True, dtype, InputLayout, MutAnyOrigin],
+    ln_weight: TileTensor[mut=True, dtype, LnParamsLayout, MutAnyOrigin],
+    ln_bias: TileTensor[mut=True, dtype, LnParamsLayout, MutAnyOrigin],
+    linear_weight: TileTensor[mut=True, dtype, WeightLayout, MutAnyOrigin],
+    linear_bias: TileTensor[mut=True, dtype, BiasLayout, MutAnyOrigin],
 ):
-    """Minimal fused kernel - one thread per sequence position to avoid redundancy.
-    """
+    """Minimal fused kernel: one thread per sequence position."""
     # Grid: (batch_size, seq_len) - one thread block per sequence position
     # Block: (1,) - single thread per sequence position to avoid redundant computation
-    batch_idx = Int(block_idx.x)
-    seq_idx = Int(block_idx.y)
+    var batch_idx = block_idx.x
+    var seq_idx = block_idx.y
 
     if batch_idx >= batch_size or seq_idx >= seq_len:
         return
+
+    var output_lt = output.to_layout_tensor()
+    var input_lt = input.to_layout_tensor()
+    var ln_weight_lt = ln_weight.to_layout_tensor()
+    var ln_bias_lt = ln_bias.to_layout_tensor()
+    var linear_weight_lt = linear_weight.to_layout_tensor()
+    var linear_bias_lt = linear_bias.to_layout_tensor()
 
     # Step 1: Compute LayerNorm statistics once per sequence position
     var sum_val: Scalar[dtype] = 0
     var sq_sum: Scalar[dtype] = 0
 
-    @parameter
-    for h in range(hidden_dim):
-        val = input[batch_idx, seq_idx, h]
+    comptime for h in range(hidden_dim):
+        var val = input_lt[batch_idx, seq_idx, h]
         sum_val += rebind[Scalar[dtype]](val)
         sq_sum += rebind[Scalar[dtype]](val * val)
 
-    mean_val = sum_val / hidden_dim
-    var_val = (sq_sum / hidden_dim) - (mean_val * mean_val)
-    inv_std = 1.0 / sqrt(var_val + 1e-5)
+    var mean_val = sum_val / Scalar[dtype](hidden_dim)
+    var var_val = (sq_sum / Scalar[dtype](hidden_dim)) - (mean_val * mean_val)
+    var inv_std = 1.0 / sqrt(var_val + 1e-5)
 
     # Step 2: Compute all outputs for this sequence position
-    @parameter
-    for out_idx in range(output_dim):
+    comptime for out_idx in range(output_dim):
         var acc: Scalar[dtype] = 0
 
-        @parameter
-        for h in range(hidden_dim):
-            input_val = input[batch_idx, seq_idx, h]
-            normalized = (input_val - mean_val) * inv_std * rebind[
+        comptime for h in range(hidden_dim):
+            var input_val = input_lt[batch_idx, seq_idx, h]
+            var normalized = (input_val - mean_val) * inv_std * rebind[
                 Scalar[dtype]
-            ](ln_weight[h]) + rebind[Scalar[dtype]](ln_bias[h])
-            acc += rebind[Scalar[dtype]](normalized * linear_weight[out_idx, h])
+            ](ln_weight_lt[h]) + rebind[Scalar[dtype]](ln_bias_lt[h])
+            acc += rebind[Scalar[dtype]](
+                normalized * linear_weight_lt[out_idx, h]
+            )
 
-        output[batch_idx, seq_idx, out_idx] = acc + rebind[Scalar[dtype]](
-            linear_bias[out_idx]
+        output_lt[batch_idx, seq_idx, out_idx] = acc + rebind[Scalar[dtype]](
+            linear_bias_lt[out_idx]
         )
 
 
@@ -299,58 +318,67 @@ fn minimal_fused_kernel[
 
 
 # ANCHOR: minimal_fused_backward_kernel_solution
-fn minimal_fused_kernel_backward[
-    grad_output_layout: Layout,
-    input_layout: Layout,
-    ln_params_layout: Layout,
-    weight_layout: Layout,
-    grad_input_layout: Layout,
-    grad_ln_weight_layout: Layout,
-    grad_ln_bias_layout: Layout,
-    grad_weight_layout: Layout,
-    grad_bias_layout: Layout,
+def minimal_fused_kernel_backward[
     batch_size: Int,
     seq_len: Int,
     hidden_dim: Int,
     output_dim: Int,
+    GradInputLayout: TensorLayout,
+    GradLnWeightLayout: TensorLayout,
+    GradLnBiasLayout: TensorLayout,
+    GradWeightLayout: TensorLayout,
+    GradBiasLayout: TensorLayout,
+    GradOutputLayout: TensorLayout,
+    InputLayout: TensorLayout,
+    LnParamsLayout: TensorLayout,
+    WeightLayout: TensorLayout,
     dtype: DType = DType.float32,
 ](
-    grad_input: LayoutTensor[dtype, grad_input_layout, MutAnyOrigin],
-    grad_ln_weight: LayoutTensor[dtype, grad_ln_weight_layout, MutAnyOrigin],
-    grad_ln_bias: LayoutTensor[dtype, grad_ln_bias_layout, MutAnyOrigin],
-    grad_weight: LayoutTensor[dtype, grad_weight_layout, MutAnyOrigin],
-    grad_bias: LayoutTensor[dtype, grad_bias_layout, MutAnyOrigin],
-    grad_output: LayoutTensor[dtype, grad_output_layout, ImmutAnyOrigin],
-    input: LayoutTensor[dtype, input_layout, ImmutAnyOrigin],
-    ln_weight: LayoutTensor[dtype, ln_params_layout, ImmutAnyOrigin],
-    ln_bias: LayoutTensor[dtype, ln_params_layout, ImmutAnyOrigin],
-    linear_weight: LayoutTensor[dtype, weight_layout, ImmutAnyOrigin],
+    grad_input: TileTensor[mut=True, dtype, GradInputLayout, MutAnyOrigin],
+    grad_ln_weight: TileTensor[
+        mut=True, dtype, GradLnWeightLayout, MutAnyOrigin
+    ],
+    grad_ln_bias: TileTensor[mut=True, dtype, GradLnBiasLayout, MutAnyOrigin],
+    grad_weight: TileTensor[mut=True, dtype, GradWeightLayout, MutAnyOrigin],
+    grad_bias: TileTensor[mut=True, dtype, GradBiasLayout, MutAnyOrigin],
+    grad_output: TileTensor[mut=True, dtype, GradOutputLayout, MutAnyOrigin],
+    input: TileTensor[mut=True, dtype, InputLayout, MutAnyOrigin],
+    ln_weight: TileTensor[mut=True, dtype, LnParamsLayout, MutAnyOrigin],
+    ln_bias: TileTensor[mut=True, dtype, LnParamsLayout, MutAnyOrigin],
+    linear_weight: TileTensor[mut=True, dtype, WeightLayout, MutAnyOrigin],
 ):
-    """Fused backward kernel using atomic operations for safe gradient accumulation.
-    """
+    """Fused backward kernel: atomics for safe gradient accumulation."""
     # Grid: (batch_size, seq_len) - one thread per sequence position
     # Block: (1,) - single thread per sequence position
-    batch_idx = Int(block_idx.x)
-    seq_idx = Int(block_idx.y)
+    var batch_idx = block_idx.x
+    var seq_idx = block_idx.y
 
     if batch_idx >= batch_size or seq_idx >= seq_len:
         return
 
+    var grad_input_lt = grad_input.to_layout_tensor()
+    var grad_ln_weight_lt = grad_ln_weight.to_layout_tensor()
+    var grad_ln_bias_lt = grad_ln_bias.to_layout_tensor()
+    var grad_weight_lt = grad_weight.to_layout_tensor()
+    var grad_bias_lt = grad_bias.to_layout_tensor()
+    var grad_output_lt = grad_output.to_layout_tensor()
+    var input_lt = input.to_layout_tensor()
+    var ln_weight_lt = ln_weight.to_layout_tensor()
+    var ln_bias_lt = ln_bias.to_layout_tensor()
+    var linear_weight_lt = linear_weight.to_layout_tensor()
+
     # Initialize gradient tensors to zero (block 0,0 only to avoid UB with atomic ops)
     if batch_idx == 0 and seq_idx == 0:
         # Initialize grad_ln_weight and grad_ln_bias
-        @parameter
-        for h in range(hidden_dim):
+        comptime for h in range(hidden_dim):
             (grad_ln_weight.ptr + h).init_pointee_copy(0)
             (grad_ln_bias.ptr + h).init_pointee_copy(0)
 
         # Initialize grad_weight and grad_bias
-        @parameter
-        for out_idx in range(output_dim):
+        comptime for out_idx in range(output_dim):
             (grad_bias.ptr + out_idx).init_pointee_copy(0)
 
-            @parameter
-            for h in range(hidden_dim):
+            comptime for h in range(hidden_dim):
                 (grad_weight.ptr + out_idx * hidden_dim + h).init_pointee_copy(
                     0
                 )
@@ -362,63 +390,56 @@ fn minimal_fused_kernel_backward[
     var sum_val: Scalar[dtype] = 0
     var sq_sum: Scalar[dtype] = 0
 
-    @parameter
-    for h in range(hidden_dim):
-        val = input[batch_idx, seq_idx, h]
+    comptime for h in range(hidden_dim):
+        var val = input_lt[batch_idx, seq_idx, h]
         sum_val += rebind[Scalar[dtype]](val)
         sq_sum += rebind[Scalar[dtype]](val * val)
 
-    mean_val = sum_val / hidden_dim
-    var_val = (sq_sum / hidden_dim) - (mean_val * mean_val)
-    inv_std = 1.0 / sqrt(var_val + 1e-5)
+    var mean_val = sum_val / Scalar[dtype](hidden_dim)
+    var var_val = (sq_sum / Scalar[dtype](hidden_dim)) - (mean_val * mean_val)
+    var inv_std = 1.0 / sqrt(var_val + 1e-5)
 
     # Step 2: Atomically accumulate gradients w.r.t. linear bias
-    @parameter
-    for out_idx in range(output_dim):
-        grad_bias_ptr = grad_bias.ptr + out_idx
+    comptime for out_idx in range(output_dim):
+        var grad_bias_ptr = grad_bias.ptr + out_idx
         _ = Atomic[dtype].fetch_add(
             grad_bias_ptr,
-            rebind[Scalar[dtype]](grad_output[batch_idx, seq_idx, out_idx]),
+            rebind[Scalar[dtype]](grad_output_lt[batch_idx, seq_idx, out_idx]),
         )
 
     # Step 3: Atomically accumulate gradients w.r.t. linear weight
-    @parameter
-    for out_idx in range(output_dim):
-
-        @parameter
-        for h in range(hidden_dim):
-            var input_val = input[batch_idx, seq_idx, h]
+    comptime for out_idx in range(output_dim):
+        comptime for h in range(hidden_dim):
+            var input_val = input_lt[batch_idx, seq_idx, h]
             var normalized = (input_val - mean_val) * inv_std
             var ln_output_val = normalized * rebind[Scalar[dtype]](
-                ln_weight[h]
-            ) + rebind[Scalar[dtype]](ln_bias[h])
+                ln_weight_lt[h]
+            ) + rebind[Scalar[dtype]](ln_bias_lt[h])
 
             # Atomic gradient accumulation for linear weight
             var grad_w = (
-                grad_output[batch_idx, seq_idx, out_idx] * ln_output_val
+                grad_output_lt[batch_idx, seq_idx, out_idx] * ln_output_val
             )
             var grad_weight_ptr = grad_weight.ptr + out_idx * hidden_dim + h
             _ = Atomic.fetch_add(grad_weight_ptr, rebind[Scalar[dtype]](grad_w))
 
     # Step 4: Atomically accumulate gradients w.r.t. LayerNorm parameters
-    @parameter
-    for h in range(hidden_dim):
-        input_val = input[batch_idx, seq_idx, h]
+    comptime for h in range(hidden_dim):
+        input_val = input_lt[batch_idx, seq_idx, h]
         normalized = (input_val - mean_val) * inv_std
 
         # Compute gradient w.r.t. LayerNorm output for this h
         var grad_ln_out: Scalar[dtype] = 0
 
-        @parameter
-        for out_idx in range(output_dim):
+        comptime for out_idx in range(output_dim):
             grad_ln_out = grad_ln_out + rebind[Scalar[dtype]](
-                grad_output[batch_idx, seq_idx, out_idx]
-                * linear_weight[out_idx, h]
+                grad_output_lt[batch_idx, seq_idx, out_idx]
+                * linear_weight_lt[out_idx, h]
             )
 
         # Atomic accumulation of LayerNorm parameter gradients
-        grad_ln_weight_ptr = grad_ln_weight.ptr + h
-        grad_ln_bias_ptr = grad_ln_bias.ptr + h
+        var grad_ln_weight_ptr = grad_ln_weight.ptr + h
+        var grad_ln_bias_ptr = grad_ln_bias.ptr + h
         _ = Atomic[dtype].fetch_add(
             grad_ln_weight_ptr, rebind[Scalar[dtype]](grad_ln_out * normalized)
         )
@@ -431,21 +452,19 @@ fn minimal_fused_kernel_backward[
     var sum_grad_normalized: Scalar[dtype] = 0
     var sum_grad_normalized_times_normalized: Scalar[dtype] = 0
 
-    @parameter
-    for h in range(hidden_dim):
-        h_input_val = input[batch_idx, seq_idx, h]
+    comptime for h in range(hidden_dim):
+        h_input_val = input_lt[batch_idx, seq_idx, h]
         h_normalized = (h_input_val - mean_val) * inv_std
 
         var h_grad_ln_out: Scalar[dtype] = 0
 
-        @parameter
-        for out_idx in range(output_dim):
+        comptime for out_idx in range(output_dim):
             h_grad_ln_out = h_grad_ln_out + rebind[Scalar[dtype]](
-                grad_output[batch_idx, seq_idx, out_idx]
-                * linear_weight[out_idx, h]
+                grad_output_lt[batch_idx, seq_idx, out_idx]
+                * linear_weight_lt[out_idx, h]
             )
 
-        h_grad_norm = h_grad_ln_out * rebind[Scalar[dtype]](ln_weight[h])
+        h_grad_norm = h_grad_ln_out * rebind[Scalar[dtype]](ln_weight_lt[h])
         sum_grad_normalized = sum_grad_normalized + rebind[Scalar[dtype]](
             h_grad_norm
         )
@@ -455,25 +474,27 @@ fn minimal_fused_kernel_backward[
         )
 
     # Compute actual input gradients (no race conditions here - each thread writes to different positions)
-    @parameter
-    for h in range(hidden_dim):
-        h_input_val = input[batch_idx, seq_idx, h]
+    comptime for h in range(hidden_dim):
+        h_input_val = input_lt[batch_idx, seq_idx, h]
         h_normalized = (h_input_val - mean_val) * inv_std
 
         var h_grad_ln_out: Scalar[dtype] = 0
 
-        @parameter
-        for out_idx in range(output_dim):
+        comptime for out_idx in range(output_dim):
             h_grad_ln_out = h_grad_ln_out + rebind[Scalar[dtype]](
-                grad_output[batch_idx, seq_idx, out_idx]
-                * linear_weight[out_idx, h]
+                grad_output_lt[batch_idx, seq_idx, out_idx]
+                * linear_weight_lt[out_idx, h]
             )
 
-        h_grad_norm = h_grad_ln_out * rebind[Scalar[dtype]](ln_weight[h])
-        grad_input[batch_idx, seq_idx, h] = inv_std * (
+        h_grad_norm = h_grad_ln_out * rebind[Scalar[dtype]](ln_weight_lt[h])
+        grad_input_lt[batch_idx, seq_idx, h] = inv_std * (
             h_grad_norm
-            - (sum_grad_normalized / hidden_dim)
-            - (h_normalized * sum_grad_normalized_times_normalized / hidden_dim)
+            - (sum_grad_normalized / Scalar[dtype](hidden_dim))
+            - (
+                h_normalized
+                * sum_grad_normalized_times_normalized
+                / Scalar[dtype](hidden_dim)
+            )
         )
 
 
@@ -483,7 +504,7 @@ fn minimal_fused_kernel_backward[
 @compiler.register("layernorm_linear")
 struct LayerNormLinearCustomOp:
     @staticmethod
-    fn execute[
+    def execute[
         target: StaticString,
         algorithm: StaticString,
         batch_size: Int,
@@ -492,60 +513,64 @@ struct LayerNormLinearCustomOp:
         output_dim: Int,
         dtype: DType = DType.float32,
     ](
-        output: OutputTensor[dtype=dtype, rank=3],
-        input: InputTensor[dtype=dtype, rank=3],
-        ln_weight: InputTensor[dtype=dtype, rank=1],
-        ln_bias: InputTensor[dtype=dtype, rank=1],
-        linear_weight: InputTensor[dtype=dtype, rank=2],
-        linear_bias: InputTensor[dtype=dtype, rank=1],
-        ctx: DeviceContextPtr,
+        output: OutputTensor[dtype=dtype, rank=3, static_spec=_],
+        input: InputTensor[dtype=dtype, rank=3, static_spec=_],
+        ln_weight: InputTensor[dtype=dtype, rank=1, static_spec=_],
+        ln_bias: InputTensor[dtype=dtype, rank=1, static_spec=_],
+        linear_weight: InputTensor[dtype=dtype, rank=2, static_spec=_],
+        linear_bias: InputTensor[dtype=dtype, rank=1, static_spec=_],
+        ctx: DeviceContext,
     ) raises:
-        comptime input_layout = input.static_spec.to_layout()
-        comptime ln_params_layout = ln_weight.static_spec.to_layout()
-        comptime weight_layout = linear_weight.static_spec.to_layout()
-        comptime bias_layout = linear_bias.static_spec.to_layout()
-        comptime output_layout = output.static_spec.to_layout()
+        comptime input_layout_val = row_major[batch_size, seq_len, hidden_dim]()
+        comptime ln_params_layout_val = row_major[hidden_dim]()
+        comptime weight_layout_val = row_major[output_dim, hidden_dim]()
+        comptime bias_layout_val = row_major[output_dim]()
+        comptime output_layout_val = row_major[
+            batch_size, seq_len, output_dim
+        ]()
+        comptime InputLayout = type_of(input_layout_val)
+        comptime LnParamsLayout = type_of(ln_params_layout_val)
+        comptime WeightLayout = type_of(weight_layout_val)
+        comptime BiasLayout = type_of(bias_layout_val)
+        comptime OutputLayout = type_of(output_layout_val)
 
-        # Note: rebind is necessary now but it shouldn't be!
-        output_tensor = rebind[
-            LayoutTensor[dtype, output_layout, MutAnyOrigin]
-        ](output.to_layout_tensor())
-        input_tensor = rebind[
-            LayoutTensor[dtype, input_layout, ImmutAnyOrigin]
-        ](input.to_layout_tensor())
-        ln_weight_tensor = rebind[
-            LayoutTensor[dtype, ln_params_layout, ImmutAnyOrigin]
-        ](ln_weight.to_layout_tensor())
-        ln_bias_tensor = rebind[
-            LayoutTensor[dtype, ln_params_layout, ImmutAnyOrigin]
-        ](ln_bias.to_layout_tensor())
-        linear_weight_tensor = rebind[
-            LayoutTensor[dtype, weight_layout, ImmutAnyOrigin]
-        ](linear_weight.to_layout_tensor())
-        linear_bias_tensor = rebind[
-            LayoutTensor[dtype, bias_layout, ImmutAnyOrigin]
-        ](linear_bias.to_layout_tensor())
+        var output_tensor = TileTensor[
+            mut=True, dtype, OutputLayout, MutAnyOrigin
+        ](output.unsafe_ptr(), output_layout_val)
+        var input_tensor = TileTensor[
+            mut=True, dtype, InputLayout, MutAnyOrigin
+        ](input.unsafe_ptr(), input_layout_val)
+        var ln_weight_tensor = TileTensor[
+            mut=True, dtype, LnParamsLayout, MutAnyOrigin
+        ](ln_weight.unsafe_ptr(), ln_params_layout_val)
+        var ln_bias_tensor = TileTensor[
+            mut=True, dtype, LnParamsLayout, MutAnyOrigin
+        ](ln_bias.unsafe_ptr(), ln_params_layout_val)
+        var linear_weight_tensor = TileTensor[
+            mut=True, dtype, WeightLayout, MutAnyOrigin
+        ](linear_weight.unsafe_ptr(), weight_layout_val)
+        var linear_bias_tensor = TileTensor[
+            mut=True, dtype, BiasLayout, MutAnyOrigin
+        ](linear_bias.unsafe_ptr(), bias_layout_val)
 
-        @parameter
-        if target == "gpu":
-            gpu_ctx = ctx.get_device_context()
+        comptime if target == "gpu":
+            var gpu_ctx = ctx
 
             # ANCHOR: layernorm_linear_custom_op
-            @parameter
-            if algorithm == "fused":
+            comptime if algorithm == "fused":
                 # fused case - one thread per sequence position
                 comptime kernel = minimal_fused_kernel[
-                    input_layout,
-                    ln_params_layout,
-                    weight_layout,
-                    bias_layout,
-                    output_layout,
                     batch_size,
                     seq_len,
                     hidden_dim,
                     output_dim,
+                    OutputLayout,
+                    InputLayout,
+                    LnParamsLayout,
+                    WeightLayout,
+                    BiasLayout,
                 ]
-                gpu_ctx.enqueue_function[kernel, kernel](
+                gpu_ctx.enqueue_function[kernel](
                     output_tensor,
                     input_tensor,
                     ln_weight_tensor,
@@ -558,23 +583,23 @@ struct LayerNormLinearCustomOp:
             elif algorithm == "unfused":
                 # unfused case
                 # Create intermediate normalized tensor
-                normalized_buffer = gpu_ctx.enqueue_create_buffer[dtype](
+                var normalized_buffer = gpu_ctx.enqueue_create_buffer[dtype](
                     batch_size * seq_len * hidden_dim
                 )
-                normalized_tensor = LayoutTensor[
-                    dtype, input_layout, MutAnyOrigin
-                ](normalized_buffer)
+                var normalized_tensor = TileTensor[
+                    mut=True, dtype, InputLayout, MutAnyOrigin
+                ](normalized_buffer, input_layout_val)
 
                 # Step 1: LayerNorm kernel
                 comptime kernel = layernorm_kernel[
-                    input_layout,
-                    ln_params_layout,
-                    input_layout,
                     batch_size,
                     seq_len,
                     hidden_dim,
+                    InputLayout,
+                    InputLayout,
+                    LnParamsLayout,
                 ]
-                gpu_ctx.enqueue_function[kernel, kernel](
+                gpu_ctx.enqueue_function[kernel](
                     normalized_tensor,
                     input_tensor,
                     ln_weight_tensor,
@@ -585,46 +610,53 @@ struct LayerNormLinearCustomOp:
 
                 # Step 2: Matmul on normalized data
                 # (batch_size*seq_len, output_dim) outputs from ((batch*seq, hidden) @ (hidden, output) -> (batch*seq, output) ) with one thread per output
-                total_rows = batch_size * seq_len
-                blocks_y = (
+                var total_rows = batch_size * seq_len
+                var blocks_y = (
                     total_rows + MATMUL_BLOCK_DIM_XY - 1
                 ) // MATMUL_BLOCK_DIM_XY
-                blocks_x = (
+                var blocks_x = (
                     output_dim + MATMUL_BLOCK_DIM_XY - 1
                 ) // MATMUL_BLOCK_DIM_XY
 
                 # Create intermediate result without bias
-                matmul_buffer = gpu_ctx.enqueue_create_buffer[dtype](
+                var matmul_buffer = gpu_ctx.enqueue_create_buffer[dtype](
                     batch_size * seq_len * output_dim
                 )
-                matmul_tensor = LayoutTensor[
-                    dtype, output_layout, MutAnyOrigin
-                ](matmul_buffer)
+                var matmul_tensor = TileTensor[
+                    mut=True, dtype, OutputLayout, MutAnyOrigin
+                ](matmul_buffer, output_layout_val)
 
                 # Create transposed weight matrix: [output_dim, hidden_dim] -> [hidden_dim, output_dim]
-                transposed_weight_buffer = gpu_ctx.enqueue_create_buffer[dtype](
-                    hidden_dim * output_dim
+                var transposed_weight_buffer = gpu_ctx.enqueue_create_buffer[
+                    dtype
+                ](hidden_dim * output_dim)
+                comptime transposed_weight_layout = row_major[
+                    hidden_dim, output_dim
+                ]()
+                comptime TransposedWeightLayout = type_of(
+                    transposed_weight_layout
                 )
-                transposed_weight_tensor = LayoutTensor[
+                var transposed_weight_tensor = TileTensor[
+                    mut=True,
                     dtype,
-                    Layout.row_major(hidden_dim, output_dim),
+                    TransposedWeightLayout,
                     MutAnyOrigin,
-                ](transposed_weight_buffer)
+                ](transposed_weight_buffer, transposed_weight_layout)
 
                 # Transpose the weight matrix
-                transpose_blocks_x = (
+                var transpose_blocks_x = (
                     hidden_dim + TRANSPOSE_BLOCK_DIM_XY - 1
                 ) // TRANSPOSE_BLOCK_DIM_XY
-                transpose_blocks_y = (
+                var transpose_blocks_y = (
                     output_dim + TRANSPOSE_BLOCK_DIM_XY - 1
                 ) // TRANSPOSE_BLOCK_DIM_XY
                 comptime kernel2 = transpose_kernel[
-                    weight_layout,
-                    transposed_weight_tensor.layout,
-                    UInt(output_dim),
-                    UInt(hidden_dim),
+                    output_dim,
+                    hidden_dim,
+                    TransposedWeightLayout,
+                    WeightLayout,
                 ]
-                gpu_ctx.enqueue_function[kernel2, kernel2](
+                gpu_ctx.enqueue_function[kernel2](
                     transposed_weight_tensor,
                     linear_weight_tensor,
                     grid_dim=(transpose_blocks_x, transpose_blocks_y),
@@ -632,22 +664,28 @@ struct LayerNormLinearCustomOp:
                 )
 
                 # Reshape tensors for matmul: [batch*seq, hidden] @ [hidden, output] -> [batch*seq, output]
-                flat_normalized = normalized_tensor.reshape[
-                    Layout.row_major(batch_size * seq_len, hidden_dim)
+                comptime flat_normalized_layout = row_major[
+                    batch_size * seq_len, hidden_dim
                 ]()
-                flat_matmul = matmul_tensor.reshape[
-                    Layout.row_major(batch_size * seq_len, output_dim)
+                comptime FlatNormalizedLayout = type_of(flat_normalized_layout)
+                comptime flat_matmul_layout = row_major[
+                    batch_size * seq_len, output_dim
                 ]()
+                comptime FlatMatmulLayout = type_of(flat_matmul_layout)
+                var flat_normalized = normalized_tensor.reshape(
+                    flat_normalized_layout
+                )
+                var flat_matmul = matmul_tensor.reshape(flat_matmul_layout)
 
                 comptime kernel3 = matmul_idiomatic_tiled[
-                    flat_normalized.layout,
-                    transposed_weight_tensor.layout,
-                    flat_matmul.layout,
                     batch_size * seq_len,
                     output_dim,
                     hidden_dim,
+                    FlatMatmulLayout,
+                    FlatNormalizedLayout,
+                    TransposedWeightLayout,
                 ]
-                gpu_ctx.enqueue_function[kernel3, kernel3](
+                gpu_ctx.enqueue_function[kernel3](
                     flat_matmul,
                     flat_normalized,
                     transposed_weight_tensor,
@@ -656,19 +694,23 @@ struct LayerNormLinearCustomOp:
                 )
 
                 # Step 3: Add bias - reshape matmul result back to 3D for bias addition
-                reshaped_matmul = matmul_tensor.reshape[
-                    Layout.row_major(batch_size, seq_len, output_dim)
+                comptime reshaped_matmul_layout = row_major[
+                    batch_size, seq_len, output_dim
                 ]()
+                comptime ReshapedMatmulLayout = type_of(reshaped_matmul_layout)
+                var reshaped_matmul = matmul_tensor.reshape(
+                    reshaped_matmul_layout
+                )
 
                 comptime kernel4 = add_bias_kernel[
-                    reshaped_matmul.layout,
-                    bias_layout,
-                    output_layout,
                     batch_size,
                     seq_len,
                     output_dim,
+                    OutputLayout,
+                    ReshapedMatmulLayout,
+                    BiasLayout,
                 ]
-                gpu_ctx.enqueue_function[kernel4, kernel4](
+                gpu_ctx.enqueue_function[kernel4](
                     output_tensor,
                     reshaped_matmul,
                     linear_bias_tensor,
@@ -685,31 +727,27 @@ struct LayerNormLinearCustomOp:
                     # LayerNorm
                     var sum_val: Scalar[dtype] = 0
                     for h in range(hidden_dim):
-                        sum_val += rebind[Scalar[dtype]](
-                            input_tensor[batch, seq, h]
-                        )
-                    mean_val = sum_val / hidden_dim
+                        sum_val += input_tensor[batch, seq, h]
+                    var mean_val = sum_val / Scalar[dtype](hidden_dim)
 
                     var var_sum: Scalar[dtype] = 0
                     for h in range(hidden_dim):
-                        diff = input_tensor[batch, seq, h] - mean_val
-                        var_sum += rebind[Scalar[dtype]](diff * diff)
-                    var_val = var_sum / hidden_dim
-                    inv_std = 1.0 / sqrt(var_val + 1e-5)
+                        var diff = input_tensor[batch, seq, h] - mean_val
+                        var_sum += diff * diff
+                    var var_val = var_sum / Scalar[dtype](hidden_dim)
+                    var inv_std = 1.0 / sqrt(var_val + 1e-5)
 
                     # Apply LayerNorm and Linear in one step (truly fused)
                     for out_idx in range(output_dim):
                         var acc: Scalar[dtype] = 0
                         for h in range(hidden_dim):
-                            input_val = input_tensor[batch, seq, h]
-                            normalized = (
+                            var input_val = input_tensor[batch, seq, h]
+                            var normalized = (
                                 input_val - mean_val
                             ) * inv_std * ln_weight_tensor[h] + ln_bias_tensor[
                                 h
                             ]
-                            acc += rebind[Scalar[dtype]](
-                                normalized * linear_weight_tensor[out_idx, h]
-                            )
+                            acc += normalized * linear_weight_tensor[out_idx, h]
                         output_tensor[batch, seq, out_idx] = (
                             acc + linear_bias_tensor[out_idx]
                         )
@@ -722,7 +760,7 @@ struct LayerNormLinearCustomOp:
 @compiler.register("layernorm_linear_backward")
 struct LayerNormLinearBackwardCustomOp:
     @staticmethod
-    fn execute[
+    def execute[
         target: StaticString,
         batch_size: Int,
         seq_len: Int,
@@ -730,80 +768,92 @@ struct LayerNormLinearBackwardCustomOp:
         output_dim: Int,
         dtype: DType = DType.float32,
     ](
-        grad_input: OutputTensor[dtype=dtype, rank=3],
-        grad_ln_weight: OutputTensor[dtype=dtype, rank=1],
-        grad_ln_bias: OutputTensor[dtype=dtype, rank=1],
-        grad_weight: OutputTensor[dtype=dtype, rank=2],
-        grad_bias: OutputTensor[dtype=dtype, rank=1],
-        grad_output: InputTensor[dtype=dtype, rank=3],
-        input: InputTensor[dtype=dtype, rank=3],
-        ln_weight: InputTensor[dtype=dtype, rank=1],
-        ln_bias: InputTensor[dtype=dtype, rank=1],
-        linear_weight: InputTensor[dtype=dtype, rank=2],
-        ctx: DeviceContextPtr,
+        grad_input: OutputTensor[dtype=dtype, rank=3, static_spec=_],
+        grad_ln_weight: OutputTensor[dtype=dtype, rank=1, static_spec=_],
+        grad_ln_bias: OutputTensor[dtype=dtype, rank=1, static_spec=_],
+        grad_weight: OutputTensor[dtype=dtype, rank=2, static_spec=_],
+        grad_bias: OutputTensor[dtype=dtype, rank=1, static_spec=_],
+        grad_output: InputTensor[dtype=dtype, rank=3, static_spec=_],
+        input: InputTensor[dtype=dtype, rank=3, static_spec=_],
+        ln_weight: InputTensor[dtype=dtype, rank=1, static_spec=_],
+        ln_bias: InputTensor[dtype=dtype, rank=1, static_spec=_],
+        linear_weight: InputTensor[dtype=dtype, rank=2, static_spec=_],
+        ctx: DeviceContext,
     ) raises:
-        comptime grad_output_layout = grad_output.static_spec.to_layout()
-        comptime input_layout = input.static_spec.to_layout()
-        comptime ln_params_layout = ln_weight.static_spec.to_layout()
-        comptime weight_layout = linear_weight.static_spec.to_layout()
-        comptime grad_input_layout = grad_input.static_spec.to_layout()
-        comptime grad_ln_weight_layout = grad_ln_weight.static_spec.to_layout()
-        comptime grad_ln_bias_layout = grad_ln_bias.static_spec.to_layout()
-        comptime grad_weight_layout = grad_weight.static_spec.to_layout()
-        comptime grad_bias_layout = grad_bias.static_spec.to_layout()
+        comptime input_layout_val = row_major[batch_size, seq_len, hidden_dim]()
+        comptime ln_params_layout_val = row_major[hidden_dim]()
+        comptime weight_layout_val = row_major[output_dim, hidden_dim]()
+        comptime grad_input_layout_val = row_major[
+            batch_size, seq_len, hidden_dim
+        ]()
+        comptime grad_ln_weight_layout_val = row_major[hidden_dim]()
+        comptime grad_ln_bias_layout_val = row_major[hidden_dim]()
+        comptime grad_weight_layout_val = row_major[output_dim, hidden_dim]()
+        comptime grad_bias_layout_val = row_major[output_dim]()
+        comptime grad_output_layout_val = row_major[
+            batch_size, seq_len, output_dim
+        ]()
+        comptime GradOutputLayout = type_of(grad_output_layout_val)
+        comptime InputLayout = type_of(input_layout_val)
+        comptime LnParamsLayout = type_of(ln_params_layout_val)
+        comptime WeightLayout = type_of(weight_layout_val)
+        comptime GradInputLayout = type_of(grad_input_layout_val)
+        comptime GradLnWeightLayout = type_of(grad_ln_weight_layout_val)
+        comptime GradLnBiasLayout = type_of(grad_ln_bias_layout_val)
+        comptime GradWeightLayout = type_of(grad_weight_layout_val)
+        comptime GradBiasLayout = type_of(grad_bias_layout_val)
 
-        grad_input_tensor = rebind[
-            LayoutTensor[dtype, grad_input_layout, MutAnyOrigin]
-        ](grad_input.to_layout_tensor())
-        grad_ln_weight_tensor = rebind[
-            LayoutTensor[dtype, grad_ln_weight_layout, MutAnyOrigin]
-        ](grad_ln_weight.to_layout_tensor())
-        grad_ln_bias_tensor = rebind[
-            LayoutTensor[dtype, grad_ln_bias_layout, MutAnyOrigin]
-        ](grad_ln_bias.to_layout_tensor())
-        grad_weight_tensor = rebind[
-            LayoutTensor[dtype, grad_weight_layout, MutAnyOrigin]
-        ](grad_weight.to_layout_tensor())
-        grad_bias_tensor = rebind[
-            LayoutTensor[dtype, grad_bias_layout, MutAnyOrigin]
-        ](grad_bias.to_layout_tensor())
-        grad_output_tensor = rebind[
-            LayoutTensor[dtype, grad_output_layout, ImmutAnyOrigin]
-        ](grad_output.to_layout_tensor())
-        input_tensor = rebind[
-            LayoutTensor[dtype, input_layout, ImmutAnyOrigin]
-        ](input.to_layout_tensor())
-        ln_weight_tensor = rebind[
-            LayoutTensor[dtype, ln_params_layout, ImmutAnyOrigin]
-        ](ln_weight.to_layout_tensor())
-        ln_bias_tensor = rebind[
-            LayoutTensor[dtype, ln_params_layout, ImmutAnyOrigin]
-        ](ln_bias.to_layout_tensor())
-        linear_weight_tensor = rebind[
-            LayoutTensor[dtype, weight_layout, ImmutAnyOrigin]
-        ](linear_weight.to_layout_tensor())
+        var grad_input_tensor = TileTensor[
+            mut=True, dtype, GradInputLayout, MutAnyOrigin
+        ](grad_input.unsafe_ptr(), grad_input_layout_val)
+        var grad_ln_weight_tensor = TileTensor[
+            mut=True, dtype, GradLnWeightLayout, MutAnyOrigin
+        ](grad_ln_weight.unsafe_ptr(), grad_ln_weight_layout_val)
+        var grad_ln_bias_tensor = TileTensor[
+            mut=True, dtype, GradLnBiasLayout, MutAnyOrigin
+        ](grad_ln_bias.unsafe_ptr(), grad_ln_bias_layout_val)
+        var grad_weight_tensor = TileTensor[
+            mut=True, dtype, GradWeightLayout, MutAnyOrigin
+        ](grad_weight.unsafe_ptr(), grad_weight_layout_val)
+        var grad_bias_tensor = TileTensor[
+            mut=True, dtype, GradBiasLayout, MutAnyOrigin
+        ](grad_bias.unsafe_ptr(), grad_bias_layout_val)
+        var grad_output_tensor = TileTensor[
+            mut=True, dtype, GradOutputLayout, MutAnyOrigin
+        ](grad_output.unsafe_ptr(), grad_output_layout_val)
+        var input_tensor = TileTensor[
+            mut=True, dtype, InputLayout, MutAnyOrigin
+        ](input.unsafe_ptr(), input_layout_val)
+        var ln_weight_tensor = TileTensor[
+            mut=True, dtype, LnParamsLayout, MutAnyOrigin
+        ](ln_weight.unsafe_ptr(), ln_params_layout_val)
+        var ln_bias_tensor = TileTensor[
+            mut=True, dtype, LnParamsLayout, MutAnyOrigin
+        ](ln_bias.unsafe_ptr(), ln_params_layout_val)
+        var linear_weight_tensor = TileTensor[
+            mut=True, dtype, WeightLayout, MutAnyOrigin
+        ](linear_weight.unsafe_ptr(), weight_layout_val)
 
-        @parameter
-        if target == "gpu":
-            gpu_ctx = ctx.get_device_context()
+        comptime if target == "gpu":
+            var gpu_ctx = ctx
 
             # Launch backward kernel
             comptime kernel = minimal_fused_kernel_backward[
-                grad_output_layout,
-                input_layout,
-                ln_params_layout,
-                weight_layout,
-                grad_input_layout,
-                grad_ln_weight_layout,
-                grad_ln_bias_layout,
-                grad_weight_layout,
-                grad_bias_layout,
                 batch_size,
                 seq_len,
                 hidden_dim,
                 output_dim,
+                GradInputLayout,
+                GradLnWeightLayout,
+                GradLnBiasLayout,
+                GradWeightLayout,
+                GradBiasLayout,
+                GradOutputLayout,
+                InputLayout,
+                LnParamsLayout,
+                WeightLayout,
             ]
-            gpu_ctx.enqueue_function[kernel, kernel](
+            gpu_ctx.enqueue_function[kernel](
                 grad_input_tensor,
                 grad_ln_weight_tensor,
                 grad_ln_bias_tensor,
@@ -844,17 +894,15 @@ struct LayerNormLinearBackwardCustomOp:
                     # Recompute forward pass statistics
                     var sum_val: Scalar[dtype] = 0
                     for h in range(hidden_dim):
-                        sum_val += rebind[Scalar[dtype]](
-                            input_tensor[batch, seq, h]
-                        )
-                    mean_val = sum_val / hidden_dim
+                        sum_val += input_tensor[batch, seq, h]
+                    var mean_val = sum_val / Scalar[dtype](hidden_dim)
 
                     var var_sum: Scalar[dtype] = 0
                     for h in range(hidden_dim):
-                        diff = input_tensor[batch, seq, h] - mean_val
-                        var_sum += rebind[Scalar[dtype]](diff * diff)
-                    var_val = var_sum / hidden_dim
-                    inv_std = 1.0 / sqrt(var_val + 1e-5)
+                        var diff = input_tensor[batch, seq, h] - mean_val
+                        var_sum += diff * diff
+                    var var_val = var_sum / Scalar[dtype](hidden_dim)
+                    var inv_std = 1.0 / sqrt(var_val + 1e-5)
 
                     # Gradient w.r.t. linear bias
                     for out_idx in range(output_dim):
@@ -866,11 +914,9 @@ struct LayerNormLinearBackwardCustomOp:
                     # Gradient w.r.t. linear weight
                     for out_idx in range(output_dim):
                         for h in range(hidden_dim):
-                            input_val = rebind[Scalar[dtype]](
-                                input_tensor[batch, seq, h]
-                            )
+                            input_val = input_tensor[batch, seq, h]
                             normalized = (input_val - mean_val) * inv_std
-                            ln_output_val = (
+                            var ln_output_val = (
                                 normalized * ln_weight_tensor[h]
                                 + ln_bias_tensor[h]
                             )
@@ -882,60 +928,52 @@ struct LayerNormLinearBackwardCustomOp:
 
                     # Gradient w.r.t. LayerNorm parameters
                     for h in range(hidden_dim):
-                        input_val = rebind[Scalar[dtype]](
-                            input_tensor[batch, seq, h]
-                        )
+                        input_val = input_tensor[batch, seq, h]
                         normalized = (input_val - mean_val) * inv_std
 
                         var grad_ln_out: Scalar[dtype] = 0
                         for out_idx in range(output_dim):
-                            grad_ln_out = grad_ln_out + rebind[Scalar[dtype]](
+                            grad_ln_out = grad_ln_out + (
                                 grad_output_tensor[batch, seq, out_idx]
                                 * linear_weight_tensor[out_idx, h]
                             )
 
-                        grad_ln_weight_tensor[h] = grad_ln_weight_tensor[
-                            h
-                        ] + rebind[Scalar[dtype]](grad_ln_out * normalized)
-                        grad_ln_bias_tensor[h] = grad_ln_bias_tensor[
-                            h
-                        ] + rebind[Scalar[dtype]](grad_ln_out)
+                        grad_ln_weight_tensor[h] = (
+                            grad_ln_weight_tensor[h] + grad_ln_out * normalized
+                        )
+                        grad_ln_bias_tensor[h] = (
+                            grad_ln_bias_tensor[h] + grad_ln_out
+                        )
 
                     # Gradient w.r.t. input (LayerNorm backward)
                     var sum_grad_normalized: Scalar[dtype] = 0
                     var sum_grad_normalized_times_normalized: Scalar[dtype] = 0
 
                     for h in range(hidden_dim):
-                        input_val = rebind[Scalar[dtype]](
-                            input_tensor[batch, seq, h]
-                        )
+                        input_val = input_tensor[batch, seq, h]
                         normalized = (input_val - mean_val) * inv_std
 
                         var grad_ln_out: Scalar[dtype] = 0
                         for out_idx in range(output_dim):
-                            grad_ln_out = grad_ln_out + rebind[Scalar[dtype]](
+                            grad_ln_out = grad_ln_out + (
                                 grad_output_tensor[batch, seq, out_idx]
                                 * linear_weight_tensor[out_idx, h]
                             )
 
                         grad_norm = grad_ln_out * ln_weight_tensor[h]
-                        sum_grad_normalized = sum_grad_normalized + rebind[
-                            Scalar[dtype]
-                        ](grad_norm)
+                        sum_grad_normalized = sum_grad_normalized + grad_norm
                         sum_grad_normalized_times_normalized = (
                             sum_grad_normalized_times_normalized
-                            + rebind[Scalar[dtype]](grad_norm * normalized)
+                            + grad_norm * normalized
                         )
 
                     for h in range(hidden_dim):
-                        input_val = rebind[Scalar[dtype]](
-                            input_tensor[batch, seq, h]
-                        )
+                        input_val = input_tensor[batch, seq, h]
                         normalized = (input_val - mean_val) * inv_std
 
                         var grad_ln_out: Scalar[dtype] = 0
                         for out_idx in range(output_dim):
-                            grad_ln_out = grad_ln_out + rebind[Scalar[dtype]](
+                            grad_ln_out = grad_ln_out + (
                                 grad_output_tensor[batch, seq, out_idx]
                                 * linear_weight_tensor[out_idx, h]
                             )
@@ -943,11 +981,11 @@ struct LayerNormLinearBackwardCustomOp:
                         grad_norm = grad_ln_out * ln_weight_tensor[h]
                         grad_input_tensor[batch, seq, h] = inv_std * (
                             grad_norm
-                            - (sum_grad_normalized / hidden_dim)
+                            - (sum_grad_normalized / Scalar[dtype](hidden_dim))
                             - (
                                 normalized
                                 * sum_grad_normalized_times_normalized
-                                / hidden_dim
+                                / Scalar[dtype](hidden_dim)
                             )
                         )
 
